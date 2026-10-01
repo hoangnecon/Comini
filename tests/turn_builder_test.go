@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"comini/internal/domain"
 	"comini/internal/session"
+	"comini/internal/transport"
 )
 
 func TestBuildGeminiWireBody(t *testing.T) {
@@ -533,6 +535,45 @@ func TestPolymorphicSummaryAndInputDecoding(t *testing.T) {
 	}
 	if body.Contents[2].Role != "user" || body.Contents[2].Parts[0].Text != "Turn 2" {
 		t.Errorf("turn 2 mismatch: %+v", body.Contents[2])
+	}
+}
+
+func TestLiveCCAPromptRejection(t *testing.T) {
+	token, proj, err := transport.DefaultAuthManager.GetCredentials()
+	if err != nil || token == "" {
+		t.Skip("no credentials")
+	}
+
+	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+
+	// 1. With GPT-5
+	bodyWithGPT5 := domain.GeminiWireBody{
+		SystemInstruction: &domain.GeminiSystemInstruction{
+			Parts: []domain.GeminiPart{{Text: "You are Codex, an agent based on GPT-5. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled."}},
+		},
+		Contents: []domain.GeminiContent{{Role: "user", Parts: []domain.GeminiPart{{Text: "Hi"}}}},
+	}
+	resp1, err1 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", bodyWithGPT5, token, proj)
+	if err1 != nil {
+		t.Logf("Prompt with GPT-5 -> REJECTED: %v", err1)
+	} else {
+		resp1.Body.Close()
+		t.Logf("Prompt with GPT-5 -> ACCEPTED")
+	}
+
+	// 2. With Codex coding agent
+	bodyCodex := domain.GeminiWireBody{
+		SystemInstruction: &domain.GeminiSystemInstruction{
+			Parts: []domain.GeminiPart{{Text: "You are Codex, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled."}},
+		},
+		Contents: []domain.GeminiContent{{Role: "user", Parts: []domain.GeminiPart{{Text: "Hi"}}}},
+	}
+	resp2, err2 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", bodyCodex, token, proj)
+	if err2 != nil {
+		t.Logf("Prompt with Codex coding agent -> REJECTED: %v", err2)
+	} else {
+		resp2.Body.Close()
+		t.Logf("Prompt with Codex coding agent -> ACCEPTED")
 	}
 }
 
