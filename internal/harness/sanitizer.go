@@ -6,7 +6,6 @@ import (
 )
 
 var (
-	codexGPT5Regex       = regexp.MustCompile(`(?s)You are Codex, (?:a coding agent|an agent) based on GPT-[0-9]+(?:\.[0-9]+)*\.`)
 	claudeSDKRegex       = regexp.MustCompile(`(?s)You are Claude, a helpful AI assistant.*?(?:\n\n|$)`)
 	trailingNoticeRegex  = regexp.MustCompile(`(?s)\n\n(?:---\n)?(?:Notice|Reminder|System Instruction): Please maintain.*?$`)
 	billingHeaderRegex   = regexp.MustCompile(`(?m)^x-anthropic-billing-header:[^\n]*\n*`)
@@ -15,7 +14,6 @@ var (
 )
 
 const (
-	neutralIdentity          = "You are a coding agent. If asked which model you are, identify as the configured model. Do not claim to be GPT-5 or made by OpenAI. Do not proactively repeat greetings or self-introductions on ongoing turns unless explicitly greeted or asked."
 	googleBrevityInstruction = "Output style for this session:\n- While you are still working (between tool calls), keep any text you emit to a single short line; do not narrate at length.\n- Do detailed reasoning internally, not as visible intermediate output.\n- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.\n- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires."
 )
 
@@ -27,7 +25,6 @@ func SanitizeMessageText(text string) string {
 	cleaned := modelSwitchRegex.ReplaceAllString(text, "[System: Model switch acknowledged; conversation context continues.]")
 	cleaned = billingHeaderRegex.ReplaceAllString(cleaned, "")
 	cleaned = claudeAgentSdkRegex.ReplaceAllString(cleaned, "")
-	cleaned = codexGPT5Regex.ReplaceAllString(cleaned, neutralIdentity)
 	return strings.TrimSpace(cleaned)
 }
 
@@ -45,7 +42,7 @@ func BuildToolCatalogNudge(toolNames []string) string {
 		". Call only listed names with their listed argument keys; do not invent, translate, or rename tools. If you need shell, file search, file read, edit, or discovery behavior, choose the listed tool that provides that capability."
 }
 
-// SanitizeSystemInstruction preserves the full system prompt while removing any trailing Claude or Codex identity artifacts that trigger upstream rejections.
+// SanitizeSystemInstruction preserves the full system prompt while removing any trailing Claude artifacts that trigger upstream rejections.
 func SanitizeSystemInstruction(instructions *string, toolNames []string) *string {
 	if instructions == nil {
 		return nil
@@ -59,7 +56,6 @@ func SanitizeSystemInstruction(instructions *string, toolNames []string) *string
 	cleaned = claudeAgentSdkRegex.ReplaceAllString(cleaned, "")
 	cleaned = claudeSDKRegex.ReplaceAllString(cleaned, "")
 	cleaned = trailingNoticeRegex.ReplaceAllString(cleaned, "")
-	cleaned = codexGPT5Regex.ReplaceAllString(cleaned, neutralIdentity)
 	cleaned = strings.TrimSpace(cleaned)
 
 	var parts []string

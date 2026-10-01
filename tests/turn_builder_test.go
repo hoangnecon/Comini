@@ -488,14 +488,11 @@ Follow these coding guidelines:
 	if strings.Contains(res, "x-anthropic-billing-header") {
 		t.Errorf("billing header was not removed")
 	}
-	if strings.Contains(res, "based on GPT-5") {
-		t.Errorf("GPT-5 identity was not removed")
-	}
 	if strings.Contains(res, "Claude Agent SDK") {
 		t.Errorf("Claude Agent SDK text was not removed")
 	}
-	if !strings.Contains(res, "Do not claim to be GPT-5 or made by OpenAI") {
-		t.Errorf("Neutral identity replacement missing")
+	if !strings.Contains(res, "You are Codex, a coding agent based on GPT-5.") {
+		t.Errorf("Codex system instruction was accidentally modified")
 	}
 	if !strings.Contains(res, "Follow these coding guidelines:") {
 		t.Errorf("User guidelines were accidentally stripped")
