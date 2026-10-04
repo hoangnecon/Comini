@@ -97,7 +97,25 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 				"required": []string{"input"},
 			}
 			desc := t.Description
-			if desc == "" {
+			if origName == "apply_patch" {
+				desc = "Use the `apply_patch` tool to create, edit, update, or delete files in the workspace. Pass the complete patch in the `input` parameter.\n" +
+					"Patch syntax:\n" +
+					"*** Begin Patch\n" +
+					"*** Update File: <relative_path>\n" +
+					"@@\n" +
+					" <exact context line from file>\n" +
+					"-<line to delete>\n" +
+					"+<line to add>\n" +
+					" <exact context line from file>\n" +
+					"*** End Patch\n\n" +
+					"For creating a new file:\n" +
+					"*** Begin Patch\n" +
+					"*** Add File: <relative_path>\n" +
+					"+<line 1>\n" +
+					"+<line 2>\n" +
+					"*** End Patch\n\n" +
+					"Rules: In hunks, every line must start with ' ' (unchanged context), '-' (delete), or '+' (add). Do NOT use diff line numbers like '@@ -1,5 +1,5 @@'."
+			} else if desc == "" {
 				desc = "Custom freeform tool"
 			}
 			decls = append(decls, map[string]any{

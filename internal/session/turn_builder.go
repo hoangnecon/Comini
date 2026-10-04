@@ -833,6 +833,46 @@ func BuildGeminiWireBody(
 		return t
 	}
 
+	// Pre-index all tool calls by CallID/ID to maintain full context for observations
+	type ToolCallInfo struct {
+		Name      string
+		Arguments string
+		Input     string
+	}
+	callInfoMap := make(map[string]ToolCallInfo)
+	for _, it := range items {
+		norm := normalizeType(it.Type)
+		switch norm {
+		case "functioncall", "websearchcall", "imagegenerationcall", "toolsearchcall", "customtoolcall", "localshellcall", "mcptoolcall", "dynamictoolcall", "collabagenttoolcall":
+			cid := it.CallID
+			if cid == "" {
+				cid = it.ID
+			}
+			name := it.Name
+			if name == "" && it.Tool != "" {
+				name = it.Tool
+			}
+			if name == "" && norm == "localshellcall" {
+				name = "exec_command"
+			}
+			args := it.Arguments
+			if args == "" {
+				args = it.Input
+			}
+			if cid != "" {
+				info := ToolCallInfo{
+					Name:      name,
+					Arguments: args,
+					Input:     it.Input,
+				}
+				callInfoMap[cid] = info
+				if it.ID != "" && it.ID != cid {
+					callInfoMap[it.ID] = info
+				}
+			}
+		}
+	}
+
 	for _, item := range items {
 		normType := normalizeType(item.Type)
 
@@ -1122,8 +1162,12 @@ func BuildGeminiWireBody(
 				callID = item.ID
 			}
 
-			funcName := callID
-			if store != nil {
+			info, hasInfo := callInfoMap[callID]
+			funcName := item.Name
+			if funcName == "" && hasInfo && info.Name != "" {
+				funcName = info.Name
+			}
+			if funcName == "" && store != nil {
 				if _, storedName, ok := store.Get(callID); ok && storedName != "" {
 					funcName = storedName
 				} else if item.ID != "" {
@@ -1132,8 +1176,8 @@ func BuildGeminiWireBody(
 					}
 				}
 			}
-			if funcName == callID && item.Name != "" {
-				funcName = item.Name
+			if funcName == "" {
+				funcName = callID
 			}
 			sanitizedName := schema.SanitizeFunctionName(funcName)
 
@@ -1144,16 +1188,26 @@ func BuildGeminiWireBody(
 				currentParts = append(currentParts, domain.GeminiPart{InlineData: img})
 			}
 
-			// 2. Attach clean observation
+			// 2. Attach clean observation with full tool execution context
 			if len(extractedImages) > 0 {
 				currentParts = append(currentParts, domain.GeminiPart{
 					Text: fmt.Sprintf("[Observation: tool %s returned visual image (%s)]", sanitizedName, extractedImages[0].MimeType),
 				})
 			} else {
 				respStr, _ := json.Marshal(cleanResp)
-				currentParts = append(currentParts, domain.GeminiPart{
-					Text: fmt.Sprintf("[Observation: tool %s returned: %s]", sanitizedName, string(respStr)),
-				})
+				if hasInfo && info.Input != "" && (sanitizedName == "apply_patch" || info.Name == "apply_patch") {
+					currentParts = append(currentParts, domain.GeminiPart{
+						Text: fmt.Sprintf("[Observation: tool apply_patch with input:\n%s\n-> returned: %s]", info.Input, string(respStr)),
+					})
+				} else if hasInfo && info.Arguments != "" {
+					currentParts = append(currentParts, domain.GeminiPart{
+						Text: fmt.Sprintf("[Observation: tool %s executed with %s -> returned: %s]", sanitizedName, info.Arguments, string(respStr)),
+					})
+				} else {
+					currentParts = append(currentParts, domain.GeminiPart{
+						Text: fmt.Sprintf("[Observation: tool %s returned: %s]", sanitizedName, string(respStr)),
+					})
+				}
 			}
 
 		default:
