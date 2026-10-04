@@ -97,8 +97,10 @@ func TestProbeAllCCAModelIDs(t *testing.T) {
 		"gemini-3.7-flash-tiered",
 		"gemini-pro-agent",
 		"gemini-3.1-pro-low",
+		"gemini-3.1-flash-image",
 		"claude-sonnet-4-6",
 		"claude-opus-4-6-thinking",
+		"gpt-oss-120b-medium",
 	}
 
 	body := domain.GeminiWireBody{

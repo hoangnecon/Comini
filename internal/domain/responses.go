@@ -127,6 +127,9 @@ type ModelCatalogEntry struct {
 	Created                int64            `json:"created"`
 	OwnedBy                string           `json:"owned_by"`
 	SupportedReasoningLevels []ReasoningLevel `json:"supported_reasoning_levels,omitempty"`
+	ContextWindow          int              `json:"context_window,omitempty"`
+	MaxContextWindow       int              `json:"max_context_window,omitempty"`
+	InputModalities        []string         `json:"input_modalities,omitempty"`
 }
 
 type ModelCatalogResponse struct {

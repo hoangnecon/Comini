@@ -33,93 +33,40 @@ func NewHandlers(cfg *config.Config, ccaClient *transport.CCAClient, store *sess
 
 // HandleModels returns the model catalog matching DeepSeek 2026 custom responses standard.
 func (h *Handlers) HandleModels(w http.ResponseWriter, r *http.Request) {
+	makeEntry := func(id string) domain.ModelCatalogEntry {
+		return domain.ModelCatalogEntry{
+			ID:                       id,
+			Object:                   "model",
+			Created:                  1770000000,
+			OwnedBy:                  "google-antigravity",
+			SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
+			ContextWindow:            1048576,
+			MaxContextWindow:         1048576,
+			InputModalities:          []string{"text", "image"},
+		}
+	}
+
 	resp := domain.ModelCatalogResponse{
 		Object: "list",
 		Data: []domain.ModelCatalogEntry{
-			{
-				ID:                       "deepseek-v4-pro",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "deepseek-flash",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "google-antigravity/gemini-3.7-flash",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "google-antigravity/gemini-3.8-flash",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "google-antigravity/gemini-3.1-pro",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "google-antigravity/claude-sonnet-4-6",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "google-antigravity/claude-opus-4-6-thinking",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "gemini-3.7-flash",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "gemini-3.8-flash",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "gemini-3.1-pro",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "claude-sonnet-4-6",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
-			{
-				ID:                       "claude-opus-4-6-thinking",
-				Object:                   "model",
-				Created:                  1770000000,
-				OwnedBy:                  "google-antigravity",
-				SupportedReasoningLevels: domain.DeepSeekReasoningLadder,
-			},
+			makeEntry("deepseek-v4-pro"),
+			makeEntry("deepseek-flash"),
+			makeEntry("google-antigravity/gemini-3.7-flash"),
+			makeEntry("google-antigravity/gemini-3.8-flash"),
+			makeEntry("google-antigravity/gemini-3.1-pro"),
+			makeEntry("google-antigravity/gemini-3.1-flash-image"),
+			makeEntry("google-antigravity/claude-sonnet-4-6"),
+			makeEntry("google-antigravity/claude-opus-4-6-thinking"),
+			makeEntry("google-antigravity/gpt-oss-120b-medium"),
+			makeEntry("gemini-3.7-flash"),
+			makeEntry("gemini-3.8-flash"),
+			makeEntry("gemini-3.1-pro"),
+			makeEntry("gemini-3.1-flash-image"),
+			makeEntry("gemini-pro-agent"),
+			makeEntry("gemini-3.1-pro-low"),
+			makeEntry("claude-sonnet-4-6"),
+			makeEntry("claude-opus-4-6-thinking"),
+			makeEntry("gpt-oss-120b-medium"),
 		},
 	}
 
@@ -195,8 +142,24 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		req.Model, effort, resolved.WireModelID, resolved.ThinkingLevel, len(funcDecls))
 
 	// 4. Derive Session ID
-	threadID := r.Header.Get("x-codex-parent-thread-id")
-	sessionID := session.DeriveSessionID(threadID, "")
+	parentThreadID := r.Header.Get("x-codex-parent-thread-id")
+	ownThreadID := r.Header.Get("x-codex-thread-id")
+	if ownThreadID == "" {
+		ownThreadID = r.Header.Get("x-codex-own-thread-id")
+	}
+	var firstUserText string
+	if len(req.Input) > 0 {
+		var inputItems []domain.InputItem
+		if err := json.Unmarshal(req.Input, &inputItems); err == nil {
+			for _, item := range inputItems {
+				if item.Role == "user" && item.Text != "" {
+					firstUserText = item.Text
+					break
+				}
+			}
+		}
+	}
+	sessionID := session.DeriveSessionID(parentThreadID, ownThreadID, firstUserText)
 
 	// 5. Build Wire Body
 	wireBody := session.BuildGeminiWireBody(

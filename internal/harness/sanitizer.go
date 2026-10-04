@@ -6,7 +6,7 @@ import (
 )
 
 var (
-	codexGPT5Regex       = regexp.MustCompile(`(?s)You are Codex, (?:a coding agent|an agent) based on GPT-[0-9]+(?:\.[0-9]+)*\.`)
+	codexGPT5Regex       = regexp.MustCompile(`(?i)(?:You are Codex,\s*(?:a coding agent|an agent)\s*based on\s*[a-z0-9_.-]+(?:\.[0-9]+)*\.|based on\s*GPT-[0-9a-z_.-]+)`)
 	claudeSDKRegex       = regexp.MustCompile(`(?s)You are Claude, a helpful AI assistant.*?(?:\n\n|$)`)
 	trailingNoticeRegex  = regexp.MustCompile(`(?s)\n\n(?:---\n)?(?:Notice|Reminder|System Instruction): Please maintain.*?$`)
 	billingHeaderRegex   = regexp.MustCompile(`(?m)^x-anthropic-billing-header:[^\n]*\n*`)

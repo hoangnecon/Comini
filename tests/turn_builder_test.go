@@ -493,8 +493,8 @@ Follow these coding guidelines:
 	if strings.Contains(res, "Claude Agent SDK") {
 		t.Errorf("Claude Agent SDK text was not removed")
 	}
-	if !strings.Contains(res, "You are Codex, a coding agent based on GPT-5.") {
-		t.Errorf("Codex system instruction was accidentally modified")
+	if !strings.Contains(res, "You are Codex, a coding agent.") {
+		t.Errorf("Codex system instruction was not properly sanitized to neutral identity")
 	}
 	if !strings.Contains(res, "Follow these coding guidelines:") {
 		t.Errorf("User guidelines were accidentally stripped")
@@ -538,6 +538,118 @@ func TestPolymorphicSummaryAndInputDecoding(t *testing.T) {
 	}
 }
 
+func TestToolChoiceMapping(t *testing.T) {
+	funcDecls := []map[string]any{
+		{"name": "exec_cmd", "description": "run cmd"},
+	}
+
+	// 1. Tool choice "required" -> mode "ANY"
+	req1 := domain.ResponsesRequest{
+		Model:      "gemini-3.7-flash",
+		ToolChoice: "required",
+		Input:      json.RawMessage(`[{"type":"message","role":"user","content":"hi"}]`),
+	}
+	body1 := session.BuildGeminiWireBody(&req1, "sess_tc1", funcDecls, "high", nil)
+	if body1.ToolConfig == nil || body1.ToolConfig.FunctionCallingConfig == nil {
+		t.Fatalf("expected toolConfig for required tool choice")
+	}
+	if body1.ToolConfig.FunctionCallingConfig.Mode != "ANY" {
+		t.Errorf("expected ANY, got %s", body1.ToolConfig.FunctionCallingConfig.Mode)
+	}
+
+	// 2. Specific function choice -> mode "ANY" with allowedFunctionNames
+	req2 := domain.ResponsesRequest{
+		Model: "gemini-3.7-flash",
+		ToolChoice: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "default_api:exec_cmd",
+			},
+		},
+		Input: json.RawMessage(`[{"type":"message","role":"user","content":"hi"}]`),
+	}
+	body2 := session.BuildGeminiWireBody(&req2, "sess_tc2", funcDecls, "high", nil)
+	if body2.ToolConfig == nil || body2.ToolConfig.FunctionCallingConfig == nil {
+		t.Fatalf("expected toolConfig for specific function choice")
+	}
+	cfg := body2.ToolConfig.FunctionCallingConfig
+	if cfg.Mode != "ANY" {
+		t.Errorf("expected ANY, got %s", cfg.Mode)
+	}
+	if len(cfg.AllowedFunctionNames) == 0 || cfg.AllowedFunctionNames[0] != "default_api:exec_cmd" {
+		t.Errorf("expected default_api:exec_cmd in allowedFunctionNames, got %+v", cfg.AllowedFunctionNames)
+	}
+}
+
+func TestMemoryCitationPreservedUnderBudgetPruning(t *testing.T) {
+	store := session.NewSignatureStore(time.Hour)
+	var items []map[string]any
+
+	// 1. Turn 0: User setup with Memory Citation
+	const memCitation = `<oai-mem-citation>
+<citation_entries>
+MEMORY.md:12-15|note=[project arch guidelines]
+</citation_entries>
+<rollout_ids>
+019c6e27-e55b-73d1-87d8-4e01f1f75043
+</rollout_ids>
+</oai-mem-citation>`
+
+	items = append(items, map[string]any{
+		"type": "message", "role": "user", "content": "Start project setup\n\n" + memCitation,
+	})
+
+	// 2. 60 tool executions
+	for i := 1; i <= 60; i++ {
+		callID := fmt.Sprintf("call_%d", i)
+		store.Set(callID, fmt.Sprintf("sig_%d", i), "exec_cmd")
+		items = append(items, map[string]any{
+			"type": "function_call", "name": "exec_cmd", "arguments": `{"cmd":"ls"}`, "call_id": callID,
+		})
+		items = append(items, map[string]any{
+			"type": "function_call_output", "call_id": callID, "output": strings.Repeat("x", 4000),
+		})
+	}
+
+	// 3. User middle message with memory citation
+	items = append(items, map[string]any{
+		"type": "message", "role": "user", "content": "Please check memory citation:\n" + memCitation,
+	})
+
+	// 4. 200 more tool executions
+	for i := 61; i <= 260; i++ {
+		callID := fmt.Sprintf("call_%d", i)
+		store.Set(callID, fmt.Sprintf("sig_%d", i), "exec_cmd")
+		items = append(items, map[string]any{
+			"type": "function_call", "name": "exec_cmd", "arguments": `{"cmd":"git diff"}`, "call_id": callID,
+		})
+		items = append(items, map[string]any{
+			"type": "function_call_output", "call_id": callID, "output": strings.Repeat("y", 4000),
+		})
+	}
+
+	inputBytes, _ := json.Marshal(items)
+	req := domain.ResponsesRequest{
+		Model: "gemini-3.7-flash",
+		Input: inputBytes,
+	}
+
+	body := session.BuildGeminiWireBody(&req, "sess_mem_pruning", nil, "high", store)
+
+	foundCitationCount := 0
+	for _, c := range body.Contents {
+		for _, p := range c.Parts {
+			if strings.Contains(p.Text, "019c6e27-e55b-73d1-87d8-4e01f1f75043") {
+				foundCitationCount++
+			}
+		}
+	}
+
+	if foundCitationCount < 2 {
+		t.Fatalf("expected memory citation in both user turns to be preserved, found in %d turns", foundCitationCount)
+	}
+}
+
 func TestLiveCCAPromptRejection(t *testing.T) {
 	token, proj, err := transport.DefaultAuthManager.GetCredentials()
 	if err != nil || token == "" {
@@ -576,4 +688,3 @@ func TestLiveCCAPromptRejection(t *testing.T) {
 		t.Logf("Prompt with Codex coding agent -> ACCEPTED")
 	}
 }
-

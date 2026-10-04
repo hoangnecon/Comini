@@ -260,6 +260,27 @@ func cleanSchemaNode(node any) map[string]any {
 		}
 	}
 
+	if allOf, ok := raw["allOf"].([]any); ok && len(allOf) > 0 {
+		for _, item := range allOf {
+			if itemMap, ok := item.(map[string]any); ok {
+				if itemProps, ok := itemMap["properties"].(map[string]any); ok {
+					if out["properties"] == nil {
+						out["properties"] = make(map[string]any)
+					}
+					props := out["properties"].(map[string]any)
+					for pk, pv := range itemProps {
+						if cp := cleanSchemaNode(pv); cp != nil {
+							props[pk] = cp
+						}
+					}
+				}
+			}
+		}
+		if _, hasType := out["type"]; !hasType {
+			out["type"] = "OBJECT"
+		}
+	}
+
 	// Handle anyOf / oneOf fallback
 	if _, hasType := out["type"]; !hasType {
 		if anyOf, ok := raw["anyOf"].([]any); ok && len(anyOf) > 0 {

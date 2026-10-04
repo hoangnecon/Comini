@@ -21,11 +21,20 @@ func generateDeterministicSignature(sessionID, callID, funcName string) string {
 }
 
 // DeriveSessionID derives a stable session ID from Codex thread ID or first user text.
-func DeriveSessionID(threadID, firstUserText string) string {
-	seed := strings.TrimSpace(threadID)
-	if seed == "" {
+func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
+	parent := strings.TrimSpace(parentThreadID)
+	own := strings.TrimSpace(ownThreadID)
+	var seed string
+	if parent != "" && own != "" {
+		seed = fmt.Sprintf("codex-thread:%s\x00%s", parent, own)
+	} else if parent != "" {
+		seed = fmt.Sprintf("codex-thread:%s", parent)
+	} else if own != "" {
+		seed = fmt.Sprintf("codex-thread:%s", own)
+	} else if firstUserText != "" {
 		seed = strings.TrimSpace(firstUserText)
 	}
+
 	if seed == "" {
 		return fmt.Sprintf("-%d", rand.Int63()&0x7fffffffffffffff)
 	}
@@ -651,6 +660,14 @@ func isUserConversationalContent(c domain.GeminiContent) bool {
 		}
 		if p.Text != "" {
 			trimmed := strings.TrimSpace(p.Text)
+			// Explicitly preserve memory citations, active technical plans, thread goals, and confirmed decisions
+			if strings.Contains(trimmed, "<oai-mem-citation>") ||
+				strings.Contains(trimmed, "[Active Technical Plan]") ||
+				strings.Contains(trimmed, "[User Confirmed") ||
+				strings.Contains(trimmed, "[Updated Thread Goal]") ||
+				strings.Contains(trimmed, "MEMORY_SUMMARY") {
+				return true
+			}
 			// A genuine user instruction is not a tool observation or system compaction note
 			if !strings.HasPrefix(trimmed, "[Observation:") &&
 				!strings.HasPrefix(trimmed, "[Note:") {
@@ -1350,12 +1367,52 @@ func BuildGeminiWireBody(
 		tools = []domain.GeminiTool{{FunctionDeclarations: funcDecls}}
 	}
 
+	var toolConfig *domain.GeminiToolConfig
+	if len(funcDecls) > 0 && req.ToolChoice != nil {
+		switch tc := req.ToolChoice.(type) {
+		case string:
+			switch strings.ToLower(tc) {
+			case "none":
+				toolConfig = &domain.GeminiToolConfig{
+					FunctionCallingConfig: &domain.GeminiFunctionCallingConfig{
+						Mode: "NONE",
+					},
+				}
+			case "auto":
+				toolConfig = &domain.GeminiToolConfig{
+					FunctionCallingConfig: &domain.GeminiFunctionCallingConfig{
+						Mode: "AUTO",
+					},
+				}
+			case "required":
+				toolConfig = &domain.GeminiToolConfig{
+					FunctionCallingConfig: &domain.GeminiFunctionCallingConfig{
+						Mode: "ANY",
+					},
+				}
+			}
+		case map[string]any:
+			if f, ok := tc["function"].(map[string]any); ok {
+				if fname, ok := f["name"].(string); ok && fname != "" {
+					sanitized := schema.SanitizeFunctionName(fname)
+					toolConfig = &domain.GeminiToolConfig{
+						FunctionCallingConfig: &domain.GeminiFunctionCallingConfig{
+							Mode:                 "ANY",
+							AllowedFunctionNames: []string{sanitized},
+						},
+					}
+				}
+			}
+		}
+	}
+
 	contents = enforceContextBudgetOnContents(contents)
 
 	return domain.GeminiWireBody{
 		Contents:          contents,
 		SystemInstruction: sysInst,
 		Tools:             tools,
+		ToolConfig:        toolConfig,
 		GenerationConfig:  genConfig,
 		SessionID:         sessionID,
 	}

@@ -79,6 +79,15 @@ type GeminiTool struct {
 	FunctionDeclarations []map[string]any `json:"functionDeclarations"`
 }
 
+type GeminiFunctionCallingConfig struct {
+	Mode                 string   `json:"mode,omitempty"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
+}
+
+type GeminiToolConfig struct {
+	FunctionCallingConfig *GeminiFunctionCallingConfig `json:"functionCallingConfig,omitempty"`
+}
+
 type GeminiThinkingConfig struct {
 	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
 	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
@@ -95,6 +104,7 @@ type GeminiWireBody struct {
 	Contents          []GeminiContent          `json:"contents"`
 	SystemInstruction *GeminiSystemInstruction `json:"systemInstruction,omitempty"`
 	Tools             []GeminiTool             `json:"tools,omitempty"`
+	ToolConfig        *GeminiToolConfig        `json:"toolConfig,omitempty"`
 	GenerationConfig  *GeminiGenerationConfig  `json:"generationConfig,omitempty"`
 	SessionID         string                   `json:"sessionId,omitempty"`
 }
