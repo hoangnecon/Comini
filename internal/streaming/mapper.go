@@ -298,6 +298,17 @@ func MapGeminiStreamToResponses(
 
 				// B. Standard Text Content Part
 				if len(part.Text) > 0 {
+					// Intercept plain text action format and promote to structured FunctionCall
+					if fnName, fnArgs, ok := extractActionFromText(part.Text); ok {
+						part.FunctionCall = &domain.GeminiFunctionCall{
+							Name: fnName,
+							Args: fnArgs,
+						}
+						part.Text = ""
+					}
+				}
+
+				if len(part.Text) > 0 {
 					if currentMessageID == "" {
 						currentMessageID = randomID("msg")
 						messageIndex = outputIndex
@@ -558,3 +569,29 @@ func MapGeminiStreamToResponses(
 
 	return scanner.Err()
 }
+
+func extractActionFromText(text string) (string, map[string]any, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "[Action: called ") {
+		return "", nil, false
+	}
+	rest := strings.TrimPrefix(trimmed, "[Action: called ")
+	rest = strings.TrimSuffix(rest, "]")
+
+	// Format: "<name> with <args>" or "<name> with args: <args>"
+	withIdx := strings.Index(rest, " with ")
+	if withIdx == -1 {
+		return "", nil, false
+	}
+	funcName := strings.TrimSpace(rest[:withIdx])
+	argsPart := strings.TrimSpace(rest[withIdx+len(" with "):])
+	argsPart = strings.TrimPrefix(argsPart, "args:")
+	argsPart = strings.TrimSpace(argsPart)
+
+	var argsMap map[string]any
+	if err := json.Unmarshal([]byte(argsPart), &argsMap); err == nil && argsMap != nil {
+		return funcName, argsMap, true
+	}
+	return "", nil, false
+}
+

@@ -1056,26 +1056,23 @@ func BuildGeminiWireBody(
 			}
 
 		case "commandexecution":
-			if currentRole != "" && currentRole != "model" {
-				flushTurn()
-			}
-			currentRole = "model"
-			currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Action: executed command %s]", item.Command)})
 			outText := item.AggregatedOutput
 			if outText == "" {
 				outText = item.Stdout
 			}
 			if outText != "" {
-				flushTurn()
+				if currentRole != "" && currentRole != "user" {
+					flushTurn()
+				}
 				currentRole = "user"
-				currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Observation: command output: %s]", outText)})
+				currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Observation: command %s executed -> output: %s]", item.Command, outText)})
 			}
 
 		case "mcptoolcall", "dynamictoolcall", "collabagenttoolcall":
-			if currentRole != "" && currentRole != "model" {
-				flushTurn()
+			callID := item.CallID
+			if callID == "" {
+				callID = item.ID
 			}
-			currentRole = "model"
 			callName := item.Tool
 			if callName == "" {
 				callName = item.Name
@@ -1083,186 +1080,36 @@ func BuildGeminiWireBody(
 			if item.Server != "" {
 				callName = fmt.Sprintf("%s:%s", item.Server, callName)
 			}
-			currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Action: called tool %s with %s]", callName, item.Arguments)})
+			if callID != "" {
+				untrackedCalls[callID] = true
+			}
 
 		case "functioncall", "websearchcall", "imagegenerationcall", "toolsearchcall":
-			if currentRole != "" && currentRole != "model" {
-				flushTurn()
-			}
-			currentRole = "model"
-
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
 			}
-
-			sanitizedName := schema.SanitizeFunctionName(item.Name)
-			if sanitizedName == "" || sanitizedName == "_tool" {
-				if normType == "websearchcall" {
-					sanitizedName = "web_search"
-				} else if normType == "imagegenerationcall" {
-					sanitizedName = "image_generation"
-				} else if normType == "toolsearchcall" {
-					sanitizedName = "tool_search"
-				}
-			}
-
-			var argsMap map[string]any
-			if err := json.Unmarshal([]byte(item.Arguments), &argsMap); err != nil {
-				argsMap = map[string]any{"raw": item.Arguments}
-			}
-			cleanArgs := sanitizeArgsMap(argsMap)
-
-			var realSig string
-			if store != nil {
-				// Tier 1: by callID
-				if callID != "" {
-					if sig, _, ok := store.Get(callID); ok && sig != "" {
-						realSig = sig
-					}
-				}
-				// Tier 2: by item.ID
-				if realSig == "" && item.ID != "" && item.ID != callID {
-					if sig, _, ok := store.Get(item.ID); ok && sig != "" {
-						realSig = sig
-					}
-				}
-				// Tier 3: by sessionID + candidate names + argsMap
-				if realSig == "" && sessionID != "" {
-					for _, cname := range candidateNames(item.Name) {
-						if sig, ok := store.GetSessionCall(sessionID, cname, argsMap); ok && sig != "" {
-							realSig = sig
-							break
-						}
-					}
-				}
-				// Tier 4: cross-session signature lookup
-				if realSig == "" {
-					for _, cname := range candidateNames(item.Name) {
-						if sig, ok := store.FindAnyCall(cname, argsMap); ok && sig != "" {
-							realSig = sig
-							break
-						}
-					}
-				}
-			}
-
-			if realSig != "" {
-				fcPart := domain.GeminiPart{
-					FunctionCall: &domain.GeminiFunctionCall{
-						ID:   callID,
-						Name: sanitizedName,
-						Args: cleanArgs,
-					},
-					ThoughtSignature: realSig,
-				}
-				currentParts = append(currentParts, fcPart)
-			} else {
+			if callID != "" {
 				untrackedCalls[callID] = true
-				if item.ID != "" {
-					untrackedCalls[item.ID] = true
-				}
-				currentParts = append(currentParts, domain.GeminiPart{
-					Text: fmt.Sprintf("[Action: called %s with %s]", sanitizedName, item.Arguments),
-				})
 			}
 
 		case "customtoolcall":
-			if currentRole != "" && currentRole != "model" {
-				flushTurn()
-			}
-			currentRole = "model"
-
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
 			}
-
-			sanitizedName := schema.SanitizeFunctionName(item.Name)
-			argsMap := map[string]any{"input": item.Input}
-			cleanArgs := sanitizeArgsMap(argsMap)
-
-			var realSig string
-			if store != nil {
-				// Tier 1: by callID
-				if callID != "" {
-					if sig, _, ok := store.Get(callID); ok && sig != "" {
-						realSig = sig
-					}
-				}
-				// Tier 2: by item.ID
-				if realSig == "" && item.ID != "" && item.ID != callID {
-					if sig, _, ok := store.Get(item.ID); ok && sig != "" {
-						realSig = sig
-					}
-				}
-				// Tier 3: by sessionID + candidate names + args
-				if realSig == "" && sessionID != "" {
-					for _, cname := range candidateNames(item.Name) {
-						if sig, ok := store.GetSessionCall(sessionID, cname, argsMap); ok && sig != "" {
-							realSig = sig
-							break
-						}
-					}
-				}
-				// Tier 4: cross-session
-				if realSig == "" {
-					for _, cname := range candidateNames(item.Name) {
-						if sig, ok := store.FindAnyCall(cname, argsMap); ok && sig != "" {
-							realSig = sig
-							break
-						}
-					}
-				}
-			}
-
-			if realSig != "" {
-				fcPart := domain.GeminiPart{
-					FunctionCall: &domain.GeminiFunctionCall{
-						ID:   callID,
-						Name: sanitizedName,
-						Args: cleanArgs,
-					},
-					ThoughtSignature: realSig,
-				}
-				currentParts = append(currentParts, fcPart)
-			} else {
-				argsStr := item.Arguments
-				if argsStr == "" {
-					argsStr = item.Input
-				}
-				currentParts = append(currentParts, domain.GeminiPart{
-					Text: fmt.Sprintf("[Action: called %s with args: %s]", sanitizedName, argsStr),
-				})
+			if callID != "" {
+				untrackedCalls[callID] = true
 			}
 
 		case "localshellcall":
-			if currentRole != "" && currentRole != "model" {
-				flushTurn()
-			}
-			currentRole = "model"
-
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
 			}
-
-			sanitizedName := "exec_command"
-			if item.Name != "" {
-				sanitizedName = schema.SanitizeFunctionName(item.Name)
+			if callID != "" {
+				untrackedCalls[callID] = true
 			}
-
-			untrackedCalls[callID] = true
-			if item.ID != "" {
-				untrackedCalls[item.ID] = true
-			}
-			cmdText := item.Arguments
-			if cmdText == "" {
-				cmdText = item.Input
-			}
-			currentParts = append(currentParts, domain.GeminiPart{
-				Text: fmt.Sprintf("[Action: called %s with args: %s]", sanitizedName, cmdText),
-			})
 
 		case "functioncalloutput", "customtoolcalloutput", "localshellcalloutput", "localshelloutput", "mcptoolcalloutput", "toolsearchoutput":
 			if currentRole != "" && currentRole != "user" {
@@ -1297,25 +1144,15 @@ func BuildGeminiWireBody(
 				currentParts = append(currentParts, domain.GeminiPart{InlineData: img})
 			}
 
-			// 2. Attach observation or functionResponse
-			if untrackedCalls[callID] || (item.ID != "" && untrackedCalls[item.ID]) || normType == "mcptoolcalloutput" || normType == "toolsearchoutput" {
-				if len(extractedImages) > 0 {
-					currentParts = append(currentParts, domain.GeminiPart{
-						Text: fmt.Sprintf("[Observation: tool %s returned visual image (%s)]", sanitizedName, extractedImages[0].MimeType),
-					})
-				} else {
-					respStr, _ := json.Marshal(cleanResp)
-					currentParts = append(currentParts, domain.GeminiPart{
-						Text: fmt.Sprintf("[Observation: tool %s returned: %s]", sanitizedName, string(respStr)),
-					})
-				}
-			} else {
+			// 2. Attach clean observation
+			if len(extractedImages) > 0 {
 				currentParts = append(currentParts, domain.GeminiPart{
-					FunctionResponse: &domain.GeminiFunctionResponse{
-						ID:       callID,
-						Name:     sanitizedName,
-						Response: cleanResp,
-					},
+					Text: fmt.Sprintf("[Observation: tool %s returned visual image (%s)]", sanitizedName, extractedImages[0].MimeType),
+				})
+			} else {
+				respStr, _ := json.Marshal(cleanResp)
+				currentParts = append(currentParts, domain.GeminiPart{
+					Text: fmt.Sprintf("[Observation: tool %s returned: %s]", sanitizedName, string(respStr)),
 				})
 			}
 
