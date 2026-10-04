@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"comini/internal/config"
 	"comini/internal/domain"
@@ -170,8 +171,8 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		h.store,
 	)
 
-	// 6. Authentication resolution (Header -> Static Token -> Auto AuthManager)
-	authHeader := r.Header.Get("Authorization")
+	// 6. Authentication resolution (Auto AuthManager -> Static Token -> Header)
+	var authHeader string
 	projectID := "aicode-consumers"
 
 	if h.authMgr != nil {
@@ -179,17 +180,33 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		if proj != "" {
 			projectID = proj
 		}
-		if authHeader == "" && err == nil && token != "" {
+		if err == nil && token != "" {
 			authHeader = "Bearer " + token
 		}
 	}
 
-	if authHeader == "" && h.cfg.StaticToken != "" {
-		authHeader = "Bearer " + h.cfg.StaticToken
+	if authHeader == "" {
+		if clientAuth := r.Header.Get("Authorization"); clientAuth != "" && (strings.HasPrefix(clientAuth, "Bearer ya29.") || strings.HasPrefix(clientAuth, "ya29.")) {
+			authHeader = clientAuth
+		} else if h.cfg.StaticToken != "" {
+			authHeader = "Bearer " + h.cfg.StaticToken
+		}
 	}
 
-	// 7. Send to CCA
+	// 7. Send to CCA with auto-refresh on 401 Unauthenticated
 	resp, err := h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
+	if err != nil && h.authMgr != nil && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED")) {
+		log.Printf("[Comini Auth] 🔄 Upstream returned 401. Triggering ForceRefresh and retrying...")
+		freshToken, freshProj, refreshErr := h.authMgr.ForceRefresh()
+		if refreshErr == nil && freshToken != "" {
+			if freshProj != "" {
+				projectID = freshProj
+			}
+			authHeader = "Bearer " + freshToken
+			resp, err = h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
+		}
+	}
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)

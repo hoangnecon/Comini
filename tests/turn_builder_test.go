@@ -742,3 +742,16 @@ func TestRealHistoricalSessionWithGemini(t *testing.T) {
 	t.Logf("Live CCA Gemini SUCCEEDED! Response length: %d bytes", len(b))
 }
 
+func TestLiveAuthManager(t *testing.T) {
+	mgr := transport.NewAuthManager()
+	token, proj, err := mgr.GetCredentials()
+	t.Logf("GetCredentials: tokenLen=%d proj=%s err=%v", len(token), proj, err)
+	if err != nil {
+		t.Fatalf("GetCredentials failed: %v", err)
+	}
+	if token == "" {
+		t.Fatalf("empty token returned")
+	}
+}
+
+

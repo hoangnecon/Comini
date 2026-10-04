@@ -40,56 +40,75 @@ func (a *AuthManager) loadStoredCredential() {
 		return
 	}
 
+	// 1. Try ~/.opencodex/auth.json
 	authPath := filepath.Join(home, ".opencodex", "auth.json")
-	data, err := os.ReadFile(authPath)
-	if err != nil {
-		return
-	}
-
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(data, &root); err != nil {
-		return
-	}
-
-	rawGA, ok := root["google-antigravity"]
-	if !ok {
-		return
-	}
-
-	var gaStruct struct {
-		ActiveAccountID string `json:"activeAccountId"`
-		Accounts        []struct {
-			ID         string `json:"id"`
-			Credential struct {
-				Access    string  `json:"access"`
-				Refresh   string  `json:"refresh"`
-				Expires   float64 `json:"expires"`
-				ProjectID string  `json:"projectId"`
-			} `json:"credential"`
-		} `json:"accounts"`
-	}
-
-	if err := json.Unmarshal(rawGA, &gaStruct); err != nil {
-		return
-	}
-
-	for _, acc := range gaStruct.Accounts {
-		if gaStruct.ActiveAccountID == "" || acc.ID == gaStruct.ActiveAccountID {
-			a.mu.Lock()
-			a.accessToken = acc.Credential.Access
-			a.refreshToken = acc.Credential.Refresh
-			a.projectID = acc.Credential.ProjectID
-			if acc.Credential.Expires > 0 {
-				a.expiresAt = time.UnixMilli(int64(acc.Credential.Expires))
+	if data, err := os.ReadFile(authPath); err == nil {
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(data, &root); err == nil {
+			if rawGA, ok := root["google-antigravity"]; ok {
+				var gaStruct struct {
+					ActiveAccountID string `json:"activeAccountId"`
+					Accounts        []struct {
+						ID         string `json:"id"`
+						Credential struct {
+							Access    string  `json:"access"`
+							Refresh   string  `json:"refresh"`
+							Expires   float64 `json:"expires"`
+							ProjectID string  `json:"projectId"`
+						} `json:"credential"`
+					} `json:"accounts"`
+				}
+				if err := json.Unmarshal(rawGA, &gaStruct); err == nil {
+					for _, acc := range gaStruct.Accounts {
+						if gaStruct.ActiveAccountID == "" || acc.ID == gaStruct.ActiveAccountID {
+							a.mu.Lock()
+							if acc.Credential.Access != "" {
+								a.accessToken = acc.Credential.Access
+							}
+							if acc.Credential.Refresh != "" {
+								a.refreshToken = acc.Credential.Refresh
+							}
+							if acc.Credential.ProjectID != "" {
+								a.projectID = acc.Credential.ProjectID
+							}
+							if acc.Credential.Expires > 0 {
+								a.expiresAt = time.UnixMilli(int64(acc.Credential.Expires))
+							}
+							a.mu.Unlock()
+							break
+						}
+					}
+				}
 			}
-			a.mu.Unlock()
-			break
+		}
+	}
+
+	// 2. Fallback to ~/.gemini/jetski-standalone-oauth-token if access token is empty
+	a.mu.RLock()
+	curToken := a.accessToken
+	curRefresh := a.refreshToken
+	a.mu.RUnlock()
+
+	if curToken == "" && curRefresh == "" {
+		jetskiPath := filepath.Join(home, ".gemini", "jetski-standalone-oauth-token")
+		if data, err := os.ReadFile(jetskiPath); err == nil {
+			var jStruct struct {
+				Token string `json:"token"`
+			}
+			if err := json.Unmarshal(data, &jStruct); err == nil && jStruct.Token != "" {
+				a.mu.Lock()
+				a.accessToken = jStruct.Token
+				a.expiresAt = time.Now().Add(50 * time.Minute)
+				a.mu.Unlock()
+			}
 		}
 	}
 }
 
 // GetCredentials returns a valid access token and project ID, auto-refreshing if expired.
 func (a *AuthManager) GetCredentials() (string, string, error) {
+	a.loadStoredCredential()
+
 	a.mu.RLock()
 	token := a.accessToken
 	refresh := a.refreshToken
@@ -97,7 +116,12 @@ func (a *AuthManager) GetCredentials() (string, string, error) {
 	project := a.projectID
 	a.mu.RUnlock()
 
-	if token != "" && time.Now().Before(exp.Add(-2*time.Minute)) {
+	if project == "" {
+		project = "aicode-consumers"
+	}
+
+	// If token exists and is valid for at least 3 more minutes, return it
+	if token != "" && !exp.IsZero() && time.Now().Before(exp.Add(-3*time.Minute)) {
 		return token, project, nil
 	}
 
@@ -115,6 +139,36 @@ func (a *AuthManager) GetCredentials() (string, string, error) {
 			return token, project, nil
 		}
 		return "", project, fmt.Errorf("failed to refresh OAuth token: %w", err)
+	}
+
+	a.mu.Lock()
+	a.accessToken = newToken
+	a.expiresAt = newExp
+	a.mu.Unlock()
+
+	return newToken, project, nil
+}
+
+// ForceRefresh forces a token refresh from Google OAuth endpoint regardless of current expiry.
+func (a *AuthManager) ForceRefresh() (string, string, error) {
+	a.loadStoredCredential()
+
+	a.mu.RLock()
+	refresh := a.refreshToken
+	project := a.projectID
+	a.mu.RUnlock()
+
+	if project == "" {
+		project = "aicode-consumers"
+	}
+
+	if refresh == "" {
+		return a.GetCredentials()
+	}
+
+	newToken, newExp, err := a.refreshOAuthToken(refresh)
+	if err != nil {
+		return a.GetCredentials()
 	}
 
 	a.mu.Lock()
