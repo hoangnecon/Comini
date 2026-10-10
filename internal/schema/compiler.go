@@ -134,23 +134,30 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 			}
 			metaMap[sanitized] = meta
 			metaMap[origName] = meta
-			params := map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"query": map[string]any{
-						"type":        "STRING",
-						"description": "Search query for tools to load.",
+			params := cleanSchemaNode(t.Parameters)
+			if params == nil {
+				params = map[string]any{
+					"type": "OBJECT",
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":        "STRING",
+							"description": "Search query for deferred tools.",
+						},
+						"limit": map[string]any{
+							"type":        "INTEGER",
+							"description": "Maximum number of tools to return.",
+						},
 					},
-					"limit": map[string]any{
-						"type":        "INTEGER",
-						"description": "Maximum number of tools to return.",
-					},
-				},
-				"required": []string{"query"},
+					"required": []string{"query"},
+				}
+			}
+			desc := t.Description
+			if desc == "" {
+				desc = "Search for deferred tools to load for next turn."
 			}
 			decls = append(decls, map[string]any{
 				"name":        sanitized,
-				"description": "Search for additional tools to load for next turn.",
+				"description": desc,
 				"parameters":  params,
 			})
 

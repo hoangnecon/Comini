@@ -18,8 +18,8 @@ import (
 )
 
 var defaultCandidateBaseURLs = []string{
-	"https://daily-cloudcode-pa.googleapis.com",
 	"https://cloudcode-pa.googleapis.com",
+	"https://daily-cloudcode-pa.googleapis.com",
 }
 
 type CCAClient struct {

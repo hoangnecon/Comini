@@ -852,6 +852,11 @@ func BuildGeminiWireBody(
 			if name == "" && it.Tool != "" {
 				name = it.Tool
 			}
+			if it.Server != "" && !strings.Contains(name, ":") {
+				name = fmt.Sprintf("%s:%s", it.Server, name)
+			} else if it.Namespace != "" && !strings.Contains(name, ":") {
+				name = fmt.Sprintf("%s:%s", it.Namespace, name)
+			}
 			if name == "" && norm == "localshellcall" {
 				name = "exec_command"
 			}
@@ -1175,6 +1180,14 @@ func BuildGeminiWireBody(
 						funcName = storedName
 					}
 				}
+			}
+			if funcName == "" && item.Tool != "" {
+				funcName = item.Tool
+			}
+			if item.Server != "" && !strings.Contains(funcName, ":") {
+				funcName = fmt.Sprintf("%s:%s", item.Server, funcName)
+			} else if item.Namespace != "" && !strings.Contains(funcName, ":") {
+				funcName = fmt.Sprintf("%s:%s", item.Namespace, funcName)
 			}
 			if funcName == "" {
 				funcName = callID

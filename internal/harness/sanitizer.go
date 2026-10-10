@@ -42,7 +42,7 @@ func BuildToolCatalogNudge(toolNames []string) string {
 	}
 	return "Tool contract: use the current tool catalog as ground truth. Valid tool names for this turn are exactly " +
 		strings.Join(quoted, ", ") +
-		". Call only listed names with their listed argument keys. When modifying, updating, or creating files, always call the `apply_patch` tool with the proper patch format instead of running shell write commands."
+		". Call only listed names with their listed argument keys."
 }
 
 // SanitizeSystemInstruction preserves the full system prompt while removing any trailing Claude artifacts that trigger upstream rejections.
