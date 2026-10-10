@@ -18,7 +18,7 @@ func TestLiveCCAImageAnalysis(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
 
 	// 1x1 red PNG
 	redPngBytes := []byte{
@@ -88,7 +88,7 @@ func TestProbeAllCCAModelIDs(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
 
 	candidateModels := []string{
 		"gemini-3.8-flash-high",

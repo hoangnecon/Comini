@@ -17,7 +17,7 @@ func TestLiveCCAInvariants(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
 
 	testCases := []struct {
 		name     string

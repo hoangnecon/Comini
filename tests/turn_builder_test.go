@@ -631,7 +631,7 @@ func TestLiveCCAPromptRejection(t *testing.T) {
 		t.Skip("no credentials")
 	}
 
-	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
 
 	// 1. With GPT-5
 	bodyWithGPT5 := domain.GeminiWireBody{
@@ -727,7 +727,7 @@ func TestRealHistoricalSessionWithGemini(t *testing.T) {
 		t.Skip("no credentials")
 	}
 
-	client := transport.NewCCAClient("https://daily-cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
 
 	resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", wb, token, proj)
 	if err != nil {
