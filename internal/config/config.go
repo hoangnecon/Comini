@@ -27,7 +27,7 @@ func Load() *Config {
 		host = h
 	}
 
-	ccaBase := "https://cloudcode-pa.googleapis.com"
+	ccaBase := "https://daily-cloudcode-pa.googleapis.com"
 	if b := os.Getenv("CCA_BASE_URL"); b != "" {
 		ccaBase = b
 	}

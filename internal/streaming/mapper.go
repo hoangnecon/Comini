@@ -362,6 +362,28 @@ func MapGeminiStreamToResponses(
 
 					geminiName := part.FunctionCall.Name
 					meta, hasMeta := toolMetaMap[geminiName]
+					if !hasMeta {
+						if m, ok := toolMetaMap[strings.ReplaceAll(geminiName, ":", "__")]; ok {
+							meta, hasMeta = m, true
+						} else if m, ok := toolMetaMap[strings.ReplaceAll(geminiName, "__", ":")]; ok {
+							meta, hasMeta = m, true
+						} else if strings.HasPrefix(geminiName, "mcp__") {
+							if m, ok := toolMetaMap[strings.TrimPrefix(geminiName, "mcp__")]; ok {
+								meta, hasMeta = m, true
+							}
+						} else if m, ok := toolMetaMap["mcp__"+geminiName]; ok {
+							meta, hasMeta = m, true
+						} else if idx := strings.LastIndex(geminiName, ":"); idx != -1 {
+							if m, ok := toolMetaMap[geminiName[idx+1:]]; ok {
+								meta, hasMeta = m, true
+							}
+						} else if idx := strings.LastIndex(geminiName, "__"); idx != -1 {
+							if m, ok := toolMetaMap[geminiName[idx+2:]]; ok {
+								meta, hasMeta = m, true
+							}
+						}
+					}
+
 					origName := geminiName
 					namespace := ""
 					if hasMeta {
@@ -450,6 +472,68 @@ func MapGeminiStreamToResponses(
 							"item":         customItem,
 						})
 
+					} else if (hasMeta && meta.IsToolSearch) || geminiName == "tool_search" || origName == "tool_search" {
+						// Dedicated Tool Search Call (client discovery expects arguments to be a JSON Object struct SearchToolCallParams)
+						searchParams := make(map[string]any)
+						if part.FunctionCall.Args != nil {
+							for k, v := range part.FunctionCall.Args {
+								searchParams[k] = v
+							}
+						}
+						if _, ok := searchParams["query"]; !ok {
+							if q, ok := searchParams["q"].(string); ok {
+								searchParams["query"] = q
+							}
+						}
+						if q, ok := searchParams["query"].(string); ok {
+							cleanQ := strings.TrimPrefix(q, "mcp__")
+							cleanQ = strings.ReplaceAll(cleanQ, "__", " ")
+							cleanQ = strings.ReplaceAll(cleanQ, ":", " ")
+							cleanQ = strings.TrimSpace(cleanQ)
+							if cleanQ != "" {
+								searchParams["query"] = cleanQ
+							}
+						}
+
+						tscItemID := randomID("tsc")
+						if store != nil {
+							store.Set(callID, sigToStore, geminiName)
+							store.Set(tscItemID, sigToStore, geminiName)
+							if sessionID != "" {
+								store.SetSessionCall(sessionID, origName, searchParams, sigToStore)
+								store.SetSessionCall(sessionID, geminiName, searchParams, sigToStore)
+							}
+						}
+
+						tscItem := map[string]any{
+							"id":        tscItemID,
+							"call_id":   callID,
+							"type":      "tool_search_call",
+							"status":    "completed",
+							"execution": "client",
+							"arguments": searchParams,
+						}
+						completedOutputItems = append(completedOutputItems, tscItem)
+
+						inProgItem := map[string]any{
+							"id":        tscItemID,
+							"call_id":   callID,
+							"type":      "tool_search_call",
+							"status":    "in_progress",
+							"execution": "client",
+							"arguments": searchParams,
+						}
+
+						emitSSE("response.output_item.added", map[string]any{
+							"output_index": fcIndex,
+							"item":         inProgItem,
+						})
+
+						emitSSE("response.output_item.done", map[string]any{
+							"output_index": fcIndex,
+							"item":         tscItem,
+						})
+
 					} else {
 						// Standard function call
 						argsJSON, _ := json.Marshal(part.FunctionCall.Args)
@@ -458,11 +542,35 @@ func MapGeminiStreamToResponses(
 							argsStr = "{}"
 						}
 
+						targetName := origName
+						targetNamespace := namespace
+						if hasMeta {
+							if meta.Namespace != "" {
+								targetNamespace = meta.Namespace
+								targetName = meta.OriginalName
+							} else {
+								targetName = meta.OriginalName
+							}
+						} else {
+							if strings.HasPrefix(origName, "mcp__") {
+								trimmed := strings.TrimPrefix(origName, "mcp__")
+								parts := strings.SplitN(trimmed, "__", 2)
+								if len(parts) == 2 {
+									targetNamespace = "mcp__" + parts[0]
+									targetName = parts[1]
+								}
+							} else if idx := strings.Index(origName, ":"); idx != -1 {
+								targetNamespace = origName[:idx]
+								targetName = origName[idx+1:]
+							}
+						}
+
 						fcItemID := randomID("fc")
 						if store != nil {
 							store.Set(callID, sigToStore, geminiName)
 							store.Set(fcItemID, sigToStore, geminiName)
 							if sessionID != "" {
+								store.SetSessionCall(sessionID, targetName, part.FunctionCall.Args, sigToStore)
 								store.SetSessionCall(sessionID, origName, part.FunctionCall.Args, sigToStore)
 								store.SetSessionCall(sessionID, geminiName, part.FunctionCall.Args, sigToStore)
 							}
@@ -472,12 +580,12 @@ func MapGeminiStreamToResponses(
 							"id":        fcItemID,
 							"call_id":   callID,
 							"type":      "function_call",
-							"name":      origName,
+							"name":      targetName,
 							"arguments": argsStr,
 							"status":    "completed",
 						}
-						if namespace != "" {
-							fcItem["namespace"] = namespace
+						if targetNamespace != "" {
+							fcItem["namespace"] = targetNamespace
 						}
 						completedOutputItems = append(completedOutputItems, fcItem)
 
@@ -485,12 +593,12 @@ func MapGeminiStreamToResponses(
 							"id":        fcItemID,
 							"call_id":   callID,
 							"type":      "function_call",
-							"name":      origName,
+							"name":      targetName,
 							"arguments": "",
 							"status":    "in_progress",
 						}
-						if namespace != "" {
-							inProgItem["namespace"] = namespace
+						if targetNamespace != "" {
+							inProgItem["namespace"] = targetNamespace
 						}
 
 						emitSSE("response.output_item.added", map[string]any{
@@ -509,11 +617,11 @@ func MapGeminiStreamToResponses(
 							"output_index": fcIndex,
 							"item_id":      fcItemID,
 							"call_id":      callID,
-							"name":         origName,
+							"name":         targetName,
 							"arguments":    argsStr,
 						}
-						if namespace != "" {
-							doneFunc["namespace"] = namespace
+						if targetNamespace != "" {
+							doneFunc["namespace"] = targetNamespace
 						}
 						emitSSE("response.function_call_arguments.done", doneFunc)
 

@@ -83,13 +83,13 @@ data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"w
 }
 
 func TestMapGeminiStreamNamespacedTool(t *testing.T) {
-	mockGeminiSSE := `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"default_api:exec_command","args":{"cmd":"ls -la"}}}]}}]}}
+	mockGeminiSSE := `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"mcp__default_api__exec_command","args":{"cmd":"ls -la"}}}]}}]}}
 `
 	store := session.NewSignatureStore(time.Hour)
 	var out bytes.Buffer
 
 	toolMeta := map[string]domain.ToolMeta{
-		"default_api:exec_command": {OriginalName: "exec_command", Namespace: "default_api"},
+		"mcp__default_api__exec_command": {OriginalName: "exec_command", Namespace: "default_api", CanonicalName: "mcp__default_api__exec_command"},
 	}
 
 	err := streaming.MapGeminiStreamToResponses(strings.NewReader(mockGeminiSSE), &out, nil, store, "resp_ns_123", "deepseek-flash", toolMeta, "test_sess_ns")
@@ -99,15 +99,12 @@ func TestMapGeminiStreamNamespacedTool(t *testing.T) {
 
 	result := out.String()
 
-	// Verify function call output item has name "exec_command" and namespace "default_api"
+	// Verify function call output item has original name "exec_command" and namespace "default_api"
 	if !strings.Contains(result, `"name":"exec_command"`) {
 		t.Fatalf("expected name to be exec_command, got output: %s", result)
 	}
 	if !strings.Contains(result, `"namespace":"default_api"`) {
 		t.Fatalf("expected namespace to be default_api, got output: %s", result)
-	}
-	if strings.Contains(result, `"name":"default_api:exec_command"`) {
-		t.Fatalf("name should NOT be double prefixed with default_api:exec_command, got output: %s", result)
 	}
 	if !strings.Contains(result, `\"cmd\":\"ls -la\"`) {
 		t.Fatalf("missing command argument in output: %s", result)

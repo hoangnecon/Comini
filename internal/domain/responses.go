@@ -33,10 +33,11 @@ type ToolDefinition struct {
 }
 
 type ToolMeta struct {
-	OriginalName string
-	Namespace    string
-	IsCustom     bool
-	IsToolSearch bool
+	OriginalName  string
+	Namespace     string
+	CanonicalName string
+	IsCustom      bool
+	IsToolSearch  bool
 }
 
 type InputItem struct {

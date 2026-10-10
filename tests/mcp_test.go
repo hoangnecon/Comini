@@ -55,20 +55,20 @@ func TestMCPToolFullLifecycle(t *testing.T) {
 		t.Fatalf("expected 2 compiled function declarations, got %d", len(decls))
 	}
 
-	// Verify scholar_mcp:search_google_scholar
+	// Verify mcp__scholar_mcp__search_google_scholar
 	foundScholar := false
 	for _, d := range decls {
-		if d["name"] == "scholar_mcp:search_google_scholar" {
+		if d["name"] == "mcp__scholar_mcp__search_google_scholar" {
 			foundScholar = true
 			break
 		}
 	}
 	if !foundScholar {
-		t.Fatalf("missing compiled scholar_mcp:search_google_scholar declaration")
+		t.Fatalf("missing compiled mcp__scholar_mcp__search_google_scholar declaration, got: %+v", decls)
 	}
 
 	// 2. Stream Mapping: When Gemini emits an MCP function call
-	mockGeminiSSE := `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"scholar_mcp:search_google_scholar","args":{"query":"quantum computing"}}}]}}]}}
+	mockGeminiSSE := `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"mcp__scholar_mcp__search_google_scholar","args":{"query":"quantum computing"}}}]}}]}}
 `
 	store := session.NewSignatureStore(time.Hour)
 	var out bytes.Buffer
@@ -98,6 +98,32 @@ func TestMCPToolFullLifecycle(t *testing.T) {
 		t.Fatalf("missing tool argument query, got: %s", respStr)
 	}
 
+	// 2b. Stream Mapping: When Gemini emits tool_search
+	mockGeminiToolSearch := `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"golab"}}}]}}]}}
+`
+	var outTS bytes.Buffer
+	err = streaming.MapGeminiStreamToResponses(
+		strings.NewReader(mockGeminiToolSearch),
+		&outTS,
+		nil,
+		store,
+		"resp_ts_test",
+		"google-antigravity/gemini-3.7-flash",
+		metaMap,
+		"sess_ts_test",
+	)
+	if err != nil {
+		t.Fatalf("tool_search streaming error: %v", err)
+	}
+	tsRespStr := outTS.String()
+	if !strings.Contains(tsRespStr, `"type":"tool_search_call"`) {
+		t.Fatalf("expected type to be tool_search_call, got: %s", tsRespStr)
+	}
+	// Verify arguments is a JSON object {"query":"golab"}, not a string "{\"query\":\"golab\"}"
+	if !strings.Contains(tsRespStr, `"arguments":{"query":"golab"}`) {
+		t.Fatalf("expected arguments object, got: %s", tsRespStr)
+	}
+
 	// 3. Turn Builder: When Codex returns an MCP tool output
 	mcpHistoryJSON := `[
 		{"type":"message","role":"user","content":"Search for quantum papers"},
@@ -119,7 +145,7 @@ func TestMCPToolFullLifecycle(t *testing.T) {
 	lastContent := wireBody.Contents[len(wireBody.Contents)-1]
 	foundObservation := false
 	for _, p := range lastContent.Parts {
-		if strings.Contains(p.Text, "scholar_mcp:search_google_scholar") && strings.Contains(p.Text, "Quantum Supremacy") {
+		if strings.Contains(p.Text, "mcp__scholar_mcp__search_google_scholar") && strings.Contains(p.Text, "Quantum Supremacy") {
 			foundObservation = true
 			break
 		}
@@ -184,6 +210,54 @@ func TestDeferredMCPToolSearchAndDynamicInjection(t *testing.T) {
 	meta, ok := metaMap2["golab:add_code_cell"]
 	if !ok || meta.Namespace != "golab" || meta.OriginalName != "add_code_cell" {
 		t.Fatalf("expected golab metadata, got: %+v", meta)
+	}
+
+	// Turn 2b: Codex returns tool_search_output containing namespace tools directly
+	toolSearchOutputItem := domain.InputItem{
+		Type:   "tool_search_output",
+		CallID: "call_search_1",
+		Tools: []domain.ToolDefinition{
+			{
+				Type: "namespace",
+				Name: "mcp__golab",
+				Tools: []domain.ToolDefinition{
+					{
+						Type:        "function",
+						Name:        "check_status",
+						Description: "Check status of Colab runtime",
+						Parameters: map[string]any{
+							"type":       "object",
+							"properties": map[string]any{},
+						},
+					},
+					{
+						Type:        "function",
+						Name:        "check_package",
+						Description: "Check Python package",
+						Parameters: map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"packageName": map[string]any{"type": "string"},
+							},
+							"required": []any{"packageName"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	allTools3 := append(initialTools, toolSearchOutputItem.Tools...)
+	decls3, metaMap3 := schema.ExtractAndCompileTools(allTools3)
+	if len(decls3) != 3 {
+		t.Fatalf("expected 3 declarations after tool_search_output, got %d", len(decls3))
+	}
+
+	if _, ok := metaMap3["mcp__golab__check_status"]; !ok {
+		t.Fatalf("expected mcp__golab__check_status in metaMap3")
+	}
+	if _, ok := metaMap3["mcp__golab__check_package"]; !ok {
+		t.Fatalf("expected mcp__golab__check_package in metaMap3")
 	}
 }
 

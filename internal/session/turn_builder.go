@@ -26,11 +26,11 @@ func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
 	own := strings.TrimSpace(ownThreadID)
 	var seed string
 	if parent != "" && own != "" {
-		seed = fmt.Sprintf("codex-thread:%s\x00%s", parent, own)
+		seed = fmt.Sprintf("thread:%s\x00%s", parent, own)
 	} else if parent != "" {
-		seed = fmt.Sprintf("codex-thread:%s", parent)
+		seed = fmt.Sprintf("thread:%s", parent)
 	} else if own != "" {
-		seed = fmt.Sprintf("codex-thread:%s", own)
+		seed = fmt.Sprintf("thread:%s", own)
 	} else if firstUserText != "" {
 		seed = strings.TrimSpace(firstUserText)
 	}
@@ -517,7 +517,7 @@ func mergeConsecutiveRoles(contents []domain.GeminiContent) []domain.GeminiConte
 }
 
 func capAllPartsText(contents []domain.GeminiContent) []domain.GeminiContent {
-	const maxSinglePartChars = 1000000 // 1MB max per text part
+	const maxSinglePartChars = 5000000 // 5MB per text part allows full source files & diffs
 
 	// Retain at most the last 3 inline images across the entire conversation history
 	imageCount := 0
@@ -533,18 +533,15 @@ func capAllPartsText(contents []domain.GeminiContent) []domain.GeminiContent {
 					}
 				}
 			}
-			// 1. Cap Text parts
+			// Cap extreme multi-megabyte single text anomalies
 			if len(p.Text) > maxSinglePartChars {
-				head := p.Text[:700000]
-				tail := p.Text[len(p.Text)-200000:]
-				p.Text = fmt.Sprintf("%s\n\n...[Text truncated %d bytes for context budget]...\n\n%s", head, len(p.Text)-900000, tail)
+				p.Text = p.Text[:maxSinglePartChars]
 			}
-			// 2. Cap FunctionResponse parts
 			if p.FunctionResponse != nil && p.FunctionResponse.Response != nil {
 				b, err := json.Marshal(p.FunctionResponse.Response)
 				if err == nil && len(b) > maxSinglePartChars {
 					p.FunctionResponse.Response = map[string]any{
-						"result": string(b[:700000]) + "\n...[Output truncated for context budget]...\n" + string(b[len(b)-200000:]),
+						"result": string(b[:maxSinglePartChars]),
 					}
 				}
 			}
@@ -678,37 +675,6 @@ func isUserConversationalContent(c domain.GeminiContent) bool {
 	return false
 }
 
-func compressHistoricalToolOutputs(contents []domain.GeminiContent, keepRecentCount int) []domain.GeminiContent {
-	cutoff := len(contents) - keepRecentCount
-	if cutoff <= 0 {
-		return contents
-	}
-
-	for i := 0; i < cutoff; i++ {
-		for pi := range contents[i].Parts {
-			p := &contents[i].Parts[pi]
-			// Compress old FunctionResponse if large (> 2000 chars)
-			if p.FunctionResponse != nil && p.FunctionResponse.Response != nil {
-				b, err := json.Marshal(p.FunctionResponse.Response)
-				if err == nil && len(b) > 2000 {
-					head := string(b[:1000])
-					tail := string(b[len(b)-500:])
-					p.FunctionResponse.Response = map[string]any{
-						"result": head + "\n...[Earlier tool output truncated for context budget]...\n" + tail,
-					}
-				}
-			}
-			// Compress old [Observation: ...] text if large (> 2000 chars)
-			if strings.HasPrefix(strings.TrimSpace(p.Text), "[Observation:") && len(p.Text) > 2000 {
-				head := p.Text[:1000]
-				tail := p.Text[len(p.Text)-500:]
-				p.Text = head + "\n...[Earlier observation truncated for context budget]...\n" + tail
-			}
-		}
-	}
-	return contents
-}
-
 func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.GeminiContent {
 	contents = capAllPartsText(contents)
 	contents = sanitizeAndValidateGeminiContents(contents)
@@ -731,22 +697,15 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.Ge
 		return total
 	}
 
-	// 1. Initial check: 6MB text budget and 500 turns ensures request fits within Google CCA 20MB limit
-	const maxCharsBudget = 6000000
+	// Full context window budget: 10,000,000 chars and 500 turns matching Gemini 1M+ token limit
+	const maxCharsBudget = 10000000
 	const maxTurnsBudget = 500
 
 	if calcTextLen(contents) <= maxCharsBudget && len(contents) <= maxTurnsBudget {
 		return contents
 	}
 
-	// 2. Tier 1 Compression: compress older tool outputs (older than last 40 turns)
-	contents = compressHistoricalToolOutputs(contents, 40)
-	if calcTextLen(contents) <= maxCharsBudget && len(contents) <= maxTurnsBudget {
-		return sanitizeAndValidateGeminiContents(contents)
-	}
-
-	// 3. Tier 2: If still exceeding budget, preserve Turn 0, ALL historical user conversational prompts,
-	// and the last 150 recent turns in full.
+	// Extreme safeguard fallback only if exceeding 10MB
 	const keepRecentTurns = 150
 	if len(contents) > keepRecentTurns+1 {
 		cutoffIndex := len(contents) - keepRecentTurns
@@ -760,13 +719,8 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.Ge
 			}
 		}
 
-		summaryPart := domain.GeminiPart{
-			Text: fmt.Sprintf("[Note: %d earlier intermediate tool execution turns pruned for context budget; all user conversation instructions preserved.]", cutoffIndex-1-len(preservedUserTurns)),
-		}
-
 		newContents := []domain.GeminiContent{first}
 		newContents = append(newContents, preservedUserTurns...)
-		newContents = append(newContents, domain.GeminiContent{Role: "user", Parts: []domain.GeminiPart{summaryPart}})
 		newContents = append(newContents, recent...)
 		contents = newContents
 	}
@@ -852,11 +806,19 @@ func BuildGeminiWireBody(
 			if name == "" && it.Tool != "" {
 				name = it.Tool
 			}
-			if it.Server != "" && !strings.Contains(name, ":") {
-				name = fmt.Sprintf("%s:%s", it.Server, name)
-			} else if it.Namespace != "" && !strings.Contains(name, ":") {
-				name = fmt.Sprintf("%s:%s", it.Namespace, name)
+			if it.Server != "" {
+				server := strings.TrimPrefix(it.Server, "mcp__")
+				name = fmt.Sprintf("mcp__%s__%s", server, name)
+			} else if it.Namespace != "" {
+				if strings.HasPrefix(it.Namespace, "mcp__") {
+					name = fmt.Sprintf("%s__%s", it.Namespace, name)
+				} else if it.Namespace == "collaboration" {
+					name = fmt.Sprintf("%s__%s", it.Namespace, name)
+				} else {
+					name = fmt.Sprintf("mcp__%s__%s", it.Namespace, name)
+				}
 			}
+			name = strings.ReplaceAll(name, ":", "__")
 			if name == "" && norm == "localshellcall" {
 				name = "exec_command"
 			}
@@ -1184,14 +1146,22 @@ func BuildGeminiWireBody(
 			if funcName == "" && item.Tool != "" {
 				funcName = item.Tool
 			}
-			if item.Server != "" && !strings.Contains(funcName, ":") {
-				funcName = fmt.Sprintf("%s:%s", item.Server, funcName)
-			} else if item.Namespace != "" && !strings.Contains(funcName, ":") {
-				funcName = fmt.Sprintf("%s:%s", item.Namespace, funcName)
+			if item.Server != "" {
+				server := strings.TrimPrefix(item.Server, "mcp__")
+				funcName = fmt.Sprintf("mcp__%s__%s", server, funcName)
+			} else if item.Namespace != "" {
+				if strings.HasPrefix(item.Namespace, "mcp__") {
+					funcName = fmt.Sprintf("%s__%s", item.Namespace, funcName)
+				} else if item.Namespace == "collaboration" {
+					funcName = fmt.Sprintf("%s__%s", item.Namespace, funcName)
+				} else {
+					funcName = fmt.Sprintf("mcp__%s__%s", item.Namespace, funcName)
+				}
 			}
 			if funcName == "" {
 				funcName = callID
 			}
+			funcName = strings.ReplaceAll(funcName, ":", "__")
 			sanitizedName := schema.SanitizeFunctionName(funcName)
 
 			extractedImages, cleanResp := extractImagesAndCleanOutput(item.Output)

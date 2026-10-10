@@ -94,9 +94,13 @@ func ResolveModelAndEffort(modelID string, effort string) ResolvedModel {
 		}
 	}
 
-	// 6. Gemini 3.7 Flash Tiered
+	// 6. Gemini 3.7 Flash models (wire models encode effort directly: -low, -medium, -high)
+	tier := "high"
+	if e == "low" || e == "medium" {
+		tier = e
+	}
 	return ResolvedModel{
-		WireModelID:   "gemini-3.7-flash-tiered",
+		WireModelID:   "gemini-3.7-flash-" + tier,
 		ThinkingLevel: thinkingLevel,
 	}
 }

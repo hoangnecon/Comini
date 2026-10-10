@@ -98,16 +98,67 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Collect all tools from top-level req.Tools and input additional_tools items
+	// 1. Collect all tools from top-level req.Tools and dynamic tool items (additional_tools, tool_search_output).
+	// ONLY collect dynamic tools that belong to the active turn (after the latest user prompt).
+	// Stale dynamic tools from historical turns are not loaded in Codex Desktop's turn router,
+	// so exposing them causes model invocation of unmounted tools resulting in "unsupported call".
 	allToolDefs := make([]domain.ToolDefinition, 0, len(req.Tools))
 	allToolDefs = append(allToolDefs, req.Tools...)
 
 	if len(req.Input) > 0 {
 		var inputItems []domain.InputItem
 		if err := json.Unmarshal(req.Input, &inputItems); err == nil {
-			for _, item := range inputItems {
-				if item.Type == "additional_tools" && len(item.Tools) > 0 {
-					allToolDefs = append(allToolDefs, item.Tools...)
+			lastUserIdx := -1
+			for i, item := range inputItems {
+				norm := strings.ToLower(strings.TrimSpace(item.Type))
+				role := strings.ToLower(strings.TrimSpace(item.Role))
+				if (norm == "message" || norm == "usermessage" || norm == "userinput") && (role == "user" || role == "") {
+					lastUserIdx = i
+				}
+			}
+
+			for i, item := range inputItems {
+				if i <= lastUserIdx {
+					continue
+				}
+
+				norm := strings.ToLower(strings.TrimSpace(item.Type))
+				norm = strings.ReplaceAll(norm, "_", "")
+				norm = strings.ReplaceAll(norm, "-", "")
+
+				if norm == "additionaltools" || norm == "toolsearchoutput" || norm == "toolsearch" {
+					if len(item.Tools) > 0 {
+						allToolDefs = append(allToolDefs, item.Tools...)
+					}
+					// Also check if tools are inside item.Output or item.Payload
+					if len(item.Tools) == 0 {
+						if len(item.Output) > 0 {
+							var toolContainer struct {
+								Tools []domain.ToolDefinition `json:"tools"`
+							}
+							if err := json.Unmarshal(item.Output, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+								allToolDefs = append(allToolDefs, toolContainer.Tools...)
+							} else {
+								var toolList []domain.ToolDefinition
+								if err := json.Unmarshal(item.Output, &toolList); err == nil && len(toolList) > 0 {
+									allToolDefs = append(allToolDefs, toolList...)
+								}
+							}
+						}
+						if len(item.Payload) > 0 {
+							var toolContainer struct {
+								Tools []domain.ToolDefinition `json:"tools"`
+							}
+							if err := json.Unmarshal(item.Payload, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+								allToolDefs = append(allToolDefs, toolContainer.Tools...)
+							} else {
+								var toolList []domain.ToolDefinition
+								if err := json.Unmarshal(item.Payload, &toolList); err == nil && len(toolList) > 0 {
+									allToolDefs = append(allToolDefs, toolList...)
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -193,7 +244,7 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Send to CCA with auto-refresh on 401 Unauthenticated
+	// 7. Send to CCA with auto-refresh on 401 Unauthenticated and fallback on 429 Resource Exhausted
 	resp, err := h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
 	if err != nil && h.authMgr != nil && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED")) {
 		log.Printf("[Comini Auth] 🔄 Upstream returned 401. Triggering ForceRefresh and retrying...")
@@ -207,8 +258,29 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If 429 Resource Exhausted on 3.7 or Pro, fallback to healthy Gemini 3.8 Flash
+	if err != nil && (strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "RESOURCE_EXHAUSTED")) {
+		fallbackModel := "gemini-3.8-flash-high"
+		if resolved.WireModelID != fallbackModel {
+			log.Printf("[Comini Quota] ⚡ Upstream 429 on %s. Seamlessly falling back to %s...", resolved.WireModelID, fallbackModel)
+			resp, err = h.ccaClient.StreamGenerateContent(r.Context(), fallbackModel, wireBody, authHeader, projectID)
+		}
+	}
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Google Cloud Code Assist upstream quota exhausted (HTTP 429). Please wait a moment for quota window reset.",
+					"type":    "insufficient_quota",
+					"code":    "rate_limit_exceeded",
+				},
+			})
+			return
+		}
+
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]any{

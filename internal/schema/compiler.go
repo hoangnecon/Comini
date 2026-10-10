@@ -54,6 +54,7 @@ func SanitizeFunctionName(name string) string {
 func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any, map[string]domain.ToolMeta) {
 	var decls []map[string]any
 	metaMap := make(map[string]domain.ToolMeta)
+	seenDecls := make(map[string]bool)
 
 	var processTool func(t domain.ToolDefinition, ns string)
 	processTool = func(t domain.ToolDefinition, ns string) {
@@ -73,19 +74,32 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 			if origName == "" {
 				origName = "custom_tool"
 			}
-			wireName := origName
+			canonicalName := origName
 			if ns != "" {
-				wireName = fmt.Sprintf("%s:%s", ns, origName)
+				canonicalName = fmt.Sprintf("%s__%s", ns, origName)
 			}
-			sanitized := SanitizeFunctionName(wireName)
+			sanitized := SanitizeFunctionName(canonicalName)
 			meta := domain.ToolMeta{
-				OriginalName: origName,
-				Namespace:    ns,
-				IsCustom:     true,
+				OriginalName:  origName,
+				Namespace:     ns,
+				CanonicalName: canonicalName,
+				IsCustom:      true,
 			}
 			metaMap[sanitized] = meta
-			metaMap[wireName] = meta
+			metaMap[canonicalName] = meta
 			metaMap[origName] = meta
+			if ns != "" {
+				metaMap[ns+":"+origName] = meta
+				metaMap[ns+"__"+origName] = meta
+				metaMap["mcp__"+ns+"__"+origName] = meta
+				metaMap["mcp__"+ns+":"+origName] = meta
+				metaMap[SanitizeFunctionName(ns+":"+origName)] = meta
+				metaMap[SanitizeFunctionName(ns+"__"+origName)] = meta
+			}
+			if seenDecls[sanitized] {
+				return
+			}
+			seenDecls[sanitized] = true
 			params := map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
@@ -128,12 +142,18 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 			origName := "tool_search"
 			sanitized := "tool_search"
 			meta := domain.ToolMeta{
-				OriginalName: origName,
-				Namespace:    ns,
-				IsToolSearch: true,
+				OriginalName:  origName,
+				Namespace:     ns,
+				CanonicalName: origName,
+				IsToolSearch:  true,
 			}
 			metaMap[sanitized] = meta
 			metaMap[origName] = meta
+			metaMap["toolSearch"] = meta
+			if seenDecls[sanitized] {
+				return
+			}
+			seenDecls[sanitized] = true
 			params := cleanSchemaNode(t.Parameters)
 			if params == nil {
 				params = map[string]any{
@@ -166,23 +186,62 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 			return
 
 		default:
-			// Regular function
+			// Regular or MCP function
 			origName := t.Name
 			if origName == "" {
 				return
 			}
-			wireName := origName
+			canonicalName := origName
 			if ns != "" {
-				wireName = fmt.Sprintf("%s:%s", ns, origName)
+				if strings.HasPrefix(ns, "mcp__") {
+					canonicalName = fmt.Sprintf("%s__%s", ns, origName)
+				} else if ns == "collaboration" {
+					canonicalName = fmt.Sprintf("%s__%s", ns, origName)
+				} else {
+					canonicalName = fmt.Sprintf("mcp__%s__%s", ns, origName)
+				}
+			} else if strings.HasPrefix(origName, "mcp__") {
+				canonicalName = origName
 			}
-			sanitized := SanitizeFunctionName(wireName)
+			sanitized := SanitizeFunctionName(canonicalName)
 			meta := domain.ToolMeta{
-				OriginalName: origName,
-				Namespace:    ns,
+				OriginalName:  origName,
+				Namespace:     ns,
+				CanonicalName: canonicalName,
 			}
 			metaMap[sanitized] = meta
-			metaMap[wireName] = meta
+			metaMap[canonicalName] = meta
 			metaMap[origName] = meta
+			if ns != "" {
+				cleanServer := strings.TrimPrefix(ns, "mcp__")
+				metaMap[ns+":"+origName] = meta
+				metaMap[ns+"__"+origName] = meta
+				metaMap[cleanServer+":"+origName] = meta
+				metaMap[cleanServer+"__"+origName] = meta
+				metaMap["mcp__"+cleanServer+"__"+origName] = meta
+				metaMap["mcp__"+cleanServer+":"+origName] = meta
+				metaMap[SanitizeFunctionName(ns+":"+origName)] = meta
+				metaMap[SanitizeFunctionName(ns+"__"+origName)] = meta
+				metaMap[SanitizeFunctionName(cleanServer+":"+origName)] = meta
+				metaMap[SanitizeFunctionName(cleanServer+"__"+origName)] = meta
+			}
+			if strings.HasPrefix(origName, "mcp__") {
+				trimmed := strings.TrimPrefix(origName, "mcp__")
+				parts := strings.SplitN(trimmed, "__", 2)
+				if len(parts) == 2 {
+					serverName, toolName := parts[0], parts[1]
+					metaMap[serverName+":"+toolName] = meta
+					metaMap[serverName+"__"+toolName] = meta
+					metaMap["mcp__"+serverName+":"+toolName] = meta
+					metaMap[SanitizeFunctionName(serverName+":"+toolName)] = meta
+					metaMap[SanitizeFunctionName(serverName+"__"+toolName)] = meta
+					metaMap[toolName] = meta
+				}
+			}
+			if seenDecls[sanitized] {
+				return
+			}
+			seenDecls[sanitized] = true
 			decls = append(decls, CompileGeminiFunctionDeclaration(t, sanitized))
 		}
 	}

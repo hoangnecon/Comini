@@ -6,7 +6,8 @@ import (
 )
 
 var (
-	codexGPT5Regex       = regexp.MustCompile(`(?i)(?:You are Codex,\s*(?:a coding agent|an agent)\s*based on\s*[a-z0-9_.-]+(?:\.[0-9]+)*\.|based on\s*GPT-[0-9a-z_.-]+)`)
+	codexGPT5Regex       = regexp.MustCompile(`(?i)(?:You are Codex,\s*(?:a coding agent|an agent)\s*based on\s*[a-z0-9_.-]+(?:\.[0-9]+)*\.|based on\s*GPT-[0-9a-z_.-]+|You are Codex,\s*a coding agent\.)`)
+	codexBrandRegex      = regexp.MustCompile(`(?i)# Codex desktop context`)
 	claudeSDKRegex       = regexp.MustCompile(`(?s)You are Claude, a helpful AI assistant.*?(?:\n\n|$)`)
 	trailingNoticeRegex  = regexp.MustCompile(`(?s)\n\n(?:---\n)?(?:Notice|Reminder|System Instruction): Please maintain.*?$`)
 	billingHeaderRegex   = regexp.MustCompile(`(?m)^x-anthropic-billing-header:[^\n]*\n*`)
@@ -15,7 +16,7 @@ var (
 )
 
 const (
-	neutralIdentity          = "You are Codex, a coding agent."
+	neutralIdentity          = "You are an expert AI software engineering assistant."
 	googleBrevityInstruction = "Output style for this session:\n- While you are still working (between tool calls), keep any text you emit to a single short line; do not narrate at length.\n- Do detailed reasoning internally, not as visible intermediate output.\n- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.\n- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires."
 )
 
@@ -28,6 +29,7 @@ func SanitizeMessageText(text string) string {
 	cleaned = billingHeaderRegex.ReplaceAllString(cleaned, "")
 	cleaned = claudeAgentSdkRegex.ReplaceAllString(cleaned, "")
 	cleaned = codexGPT5Regex.ReplaceAllString(cleaned, neutralIdentity)
+	cleaned = codexBrandRegex.ReplaceAllString(cleaned, "# Desktop client context")
 	return strings.TrimSpace(cleaned)
 }
 
@@ -60,6 +62,7 @@ func SanitizeSystemInstruction(instructions *string, toolNames []string) *string
 	cleaned = claudeSDKRegex.ReplaceAllString(cleaned, "")
 	cleaned = trailingNoticeRegex.ReplaceAllString(cleaned, "")
 	cleaned = codexGPT5Regex.ReplaceAllString(cleaned, neutralIdentity)
+	cleaned = codexBrandRegex.ReplaceAllString(cleaned, "# Desktop client context")
 	cleaned = strings.TrimSpace(cleaned)
 
 	var parts []string

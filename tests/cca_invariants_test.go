@@ -17,7 +17,7 @@ func TestLiveCCAInvariants(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("", "antigravity")
 
 	testCases := []struct {
 		name     string
@@ -212,7 +212,7 @@ func TestLiveCCAInvariants(t *testing.T) {
 					},
 				},
 			}
-			resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", body, token, proj)
+			resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", body, token, proj)
 			if err != nil {
 				fmt.Printf("❌ [%s] Failed: %v\n", tc.name, err)
 			} else {

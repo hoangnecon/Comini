@@ -18,8 +18,8 @@ import (
 )
 
 var defaultCandidateBaseURLs = []string{
-	"https://cloudcode-pa.googleapis.com",
 	"https://daily-cloudcode-pa.googleapis.com",
+	"https://cloudcode-pa.googleapis.com",
 }
 
 type CCAClient struct {
@@ -130,7 +130,7 @@ func (c *CCAClient) StreamGenerateContent(
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/ide/2.5.5 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", "antigravity/ide/2.22.0 (aidev_client; os_type=darwin; arch=arm64)")
 		if authHeader != "" {
 			ah := authHeader
 			if !strings.HasPrefix(ah, "Bearer ") {
@@ -157,11 +157,8 @@ func (c *CCAClient) StreamGenerateContent(
 
 		// Specific handling for HTTP 429 (Rate Limit / Resource Exhausted)
 		if resp.StatusCode == http.StatusTooManyRequests {
-			backoffDuration := time.Duration(800*(attempt+1)) * time.Millisecond
-			log.Printf("[CCA Warning] ⚠️ Endpoint %s returned HTTP 429 (Resource Exhausted). Backing off %v before retry %d/%d...",
-				currentBaseURL, backoffDuration, attempt+2, maxAttempts)
-			time.Sleep(backoffDuration)
-			continue
+			log.Printf("[CCA Warning] ⚠️ Endpoint %s returned HTTP 429 (Resource Exhausted). Returning immediately for instant fallback.", currentBaseURL)
+			return nil, lastErr
 		}
 
 		if resp.StatusCode == http.StatusBadGateway ||

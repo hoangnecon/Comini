@@ -104,6 +104,13 @@ func TestExtractAndCompileTools(t *testing.T) {
 	if !hasNS || nsMeta.OriginalName != "read_doc" {
 		t.Fatalf("namespaced tool should be sanitized and mapped, got %+v", nsMeta)
 	}
+
+	// Check deduplication when duplicate tools are passed
+	dupTools := append(tools, tools...)
+	declsDup, _ := schema.ExtractAndCompileTools(dupTools)
+	if len(declsDup) != 2 {
+		t.Fatalf("expected 2 unique declarations after passing duplicates, got %d", len(declsDup))
+	}
 }
 
 func TestSanitizeFunctionName(t *testing.T) {

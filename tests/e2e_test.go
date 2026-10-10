@@ -136,10 +136,10 @@ func TestResolveModelAndEffortLadder(t *testing.T) {
 		{"gemini-3.8-flash-medium", "", "gemini-3.8-flash-medium", ""},
 
 		// 3.7 Flash (thinkingLevel encodes effort)
-		{"gemini-3.7-flash", "low", "gemini-3.7-flash-tiered", "low"},
-		{"gemini-3.7-flash", "medium", "gemini-3.7-flash-tiered", "medium"},
-		{"gemini-3.7-flash", "high", "gemini-3.7-flash-tiered", "high"},
-		{"google-antigravity/gemini-3.7-flash", "", "gemini-3.7-flash-tiered", "high"},
+		{"gemini-3.7-flash", "low", "gemini-3.7-flash-low", "low"},
+		{"gemini-3.7-flash", "medium", "gemini-3.7-flash-medium", "medium"},
+		{"gemini-3.7-flash", "high", "gemini-3.7-flash-high", "high"},
+		{"google-antigravity/gemini-3.7-flash", "", "gemini-3.7-flash-high", "high"},
 
 		// 3.1 Pro (low -> gemini-3.1-pro-low, high/medium -> gemini-pro-agent)
 		{"gemini-3.1-pro", "low", "gemini-3.1-pro-low", "low"},

@@ -468,7 +468,7 @@ Follow these coding guidelines:
 	if strings.Contains(res, "Claude Agent SDK") {
 		t.Errorf("Claude Agent SDK text was not removed")
 	}
-	if !strings.Contains(res, "You are Codex, a coding agent.") {
+	if !strings.Contains(res, "You are an expert AI software engineering assistant.") {
 		t.Errorf("Codex system instruction was not properly sanitized to neutral identity")
 	}
 	if !strings.Contains(res, "Follow these coding guidelines:") {
@@ -640,7 +640,7 @@ func TestLiveCCAPromptRejection(t *testing.T) {
 		},
 		Contents: []domain.GeminiContent{{Role: "user", Parts: []domain.GeminiPart{{Text: "Hi"}}}},
 	}
-	resp1, err1 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", bodyWithGPT5, token, proj)
+	resp1, err1 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", bodyWithGPT5, token, proj)
 	if err1 != nil {
 		t.Logf("Prompt with GPT-5 -> REJECTED: %v", err1)
 	} else {
@@ -655,7 +655,7 @@ func TestLiveCCAPromptRejection(t *testing.T) {
 		},
 		Contents: []domain.GeminiContent{{Role: "user", Parts: []domain.GeminiPart{{Text: "Hi"}}}},
 	}
-	resp2, err2 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", bodyCodex, token, proj)
+	resp2, err2 := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", bodyCodex, token, proj)
 	if err2 != nil {
 		t.Logf("Prompt with Codex coding agent -> REJECTED: %v", err2)
 	} else if resp2 != nil {
@@ -727,9 +727,9 @@ func TestRealHistoricalSessionWithGemini(t *testing.T) {
 		t.Skip("no credentials")
 	}
 
-	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("", "antigravity")
 
-	resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", wb, token, proj)
+	resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", wb, token, proj)
 	if err != nil {
 		t.Fatalf("Live CCA Gemini with real payload FAILED: %v", err)
 	}

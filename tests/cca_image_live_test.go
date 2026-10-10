@@ -18,7 +18,7 @@ func TestLiveCCAImageAnalysis(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("", "antigravity")
 
 	// 1x1 red PNG
 	redPngBytes := []byte{
@@ -61,7 +61,7 @@ func TestLiveCCAImageAnalysis(t *testing.T) {
 	respStr := string(respBytes)
 	fmt.Printf("Live CCA Response: %s\n", respStr)
 
-	// Test 2: gemini-3.7-flash-tiered with thinkingConfig
+	// Test 2: gemini-3.7-flash-high with thinkingConfig
 	body37 := domain.GeminiWireBody{
 		Contents: body.Contents,
 		GenerationConfig: &domain.GeminiGenerationConfig{
@@ -71,7 +71,7 @@ func TestLiveCCAImageAnalysis(t *testing.T) {
 			},
 		},
 	}
-	resp37, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-tiered", body37, token, proj)
+	resp37, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", body37, token, proj)
 	if err != nil {
 		t.Fatalf("CCA request 3.7 failed: %v", err)
 	}
@@ -88,13 +88,13 @@ func TestProbeAllCCAModelIDs(t *testing.T) {
 		t.Skipf("Skipping live CCA test: no auth token available (%v)", err)
 	}
 
-	client := transport.NewCCAClient("https://cloudcode-pa.googleapis.com", "antigravity")
+	client := transport.NewCCAClient("", "antigravity")
 
 	candidateModels := []string{
 		"gemini-3.8-flash-high",
 		"gemini-3.8-flash-medium",
 		"gemini-3.8-flash-low",
-		"gemini-3.7-flash-tiered",
+		"gemini-3.7-flash-high",
 		"gemini-pro-agent",
 		"gemini-3.1-pro-low",
 		"gemini-3.1-flash-image",
