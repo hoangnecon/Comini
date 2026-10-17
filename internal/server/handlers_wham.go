@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -19,6 +20,22 @@ func (h *Handlers) HandleWhamUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limitReached := snap.PrimaryUsedPercent >= 100 || snap.WeeklyUsedPercent >= 100
+	primaryRem := 100 - snap.PrimaryUsedPercent
+	if primaryRem < 0 {
+		primaryRem = 0
+	}
+	weeklyRem := 100 - snap.WeeklyUsedPercent
+	if weeklyRem < 0 {
+		weeklyRem = 0
+	}
+	primaryTone := "neutral"
+	if primaryRem <= 15 {
+		primaryTone = "warning"
+	}
+	weeklyTone := "neutral"
+	if weeklyRem <= 15 {
+		weeklyTone = "warning"
+	}
 
 	payload := map[string]any{
 		"user_id":    CodexUserID,
@@ -44,19 +61,39 @@ func (h *Handlers) HandleWhamUsage(w http.ResponseWriter, r *http.Request) {
 		"code_review_rate_limit": nil,
 		"additional_rate_limits": []any{},
 		"credits": map[string]any{
-			"has_credits":          false,
-			"unlimited":            false,
-			"balance":              "0",
+			"has_credits":           false,
+			"unlimited":             false,
+			"balance":               "0",
 			"approx_local_messages": []int{0, 0},
 			"approx_cloud_messages": []int{0, 0},
 		},
 		"promo": nil,
 		"ambient_usage": map[string]any{
-			"window": map[string]any{
-				"used_percent":         snap.PrimaryUsedPercent,
-				"limit_window_seconds": 18000,
-				"reset_after_seconds":  snap.PrimaryResetAfterSec,
-				"reset_at":             snap.PrimaryResetAt,
+			"default": map[string]any{
+				"profile_subtext": fmt.Sprintf("5h: %d%% left · Weekly: %d%% left", primaryRem, weeklyRem),
+				"source": map[string]any{
+					"kind":    "included",
+					"heading": "Antigravity Quota",
+				},
+				"menu": map[string]any{
+					"rows": []map[string]any{
+						{
+							"label": "5-hour limit",
+							"value": map[string]any{
+								"text": fmt.Sprintf("%d%% left", primaryRem),
+								"tone": primaryTone,
+							},
+						},
+						{
+							"label": "Weekly limit",
+							"value": map[string]any{
+								"text": fmt.Sprintf("%d%% left", weeklyRem),
+								"tone": weeklyTone,
+							},
+						},
+					},
+					"actions": []any{},
+				},
 			},
 		},
 	}
@@ -98,6 +135,13 @@ func (h *Handlers) HandleWhamAccountsCheck(w http.ResponseWriter, r *http.Reques
 func (h *Handlers) HandleWhamResetCredits(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if strings.HasSuffix(r.URL.Path, "/history") {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"events":      []any{},
+			"next_cursor": nil,
+		})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"credits": []any{},
 		"summary": map[string]any{
@@ -147,32 +191,32 @@ func (h *Handlers) HandleAccountsFallback(w http.ResponseWriter, r *http.Request
 			"accounts": map[string]any{
 				CodexAccountID: map[string]any{
 					"account": map[string]any{
-						"account_id":                     CodexAccountID,
-						"account_user_id":                CodexUserID,
-						"account_user_role":              "account-owner",
-						"name":                           "Comini",
-						"plan_type":                      "pro",
-						"structure":                      "personal",
-						"is_zdr":                         false,
-						"is_openai_internal":             false,
-						"is_deactivated":                 false,
-						"is_fedramp_compliant_workspace": false,
+						"account_id":                       CodexAccountID,
+						"account_user_id":                  CodexUserID,
+						"account_user_role":                "account-owner",
+						"name":                             "Comini",
+						"plan_type":                        "pro",
+						"structure":                        "personal",
+						"is_zdr":                           false,
+						"is_openai_internal":               false,
+						"is_deactivated":                   false,
+						"is_fedramp_compliant_workspace":   false,
 						"has_previously_paid_subscription": true,
 						"tbo_config": map[string]any{
 							"tbo_available": false,
 						},
 					},
 					"entitlement": map[string]any{
-						"subscription_id":                "sub_comini_pro",
-						"has_active_subscription":        true,
-						"subscription_plan":              "chatgptproplan",
-						"expires_at":                     "2099-12-31T23:59:59Z",
-						"renews_at":                      "2099-12-31T23:59:59Z",
-						"billing_period":                 "monthly",
-						"is_delinquent":                  false,
-						"is_active_subscription_gratis":  false,
-						"trial":                          nil,
-						"discount":                       nil,
+						"subscription_id":               "sub_comini_pro",
+						"has_active_subscription":       true,
+						"subscription_plan":             "chatgptproplan",
+						"expires_at":                    "2099-12-31T23:59:59Z",
+						"renews_at":                     "2099-12-31T23:59:59Z",
+						"billing_period":                "monthly",
+						"is_delinquent":                 false,
+						"is_active_subscription_gratis": false,
+						"trial":                         nil,
+						"discount":                      nil,
 					},
 					"last_active_subscription": map[string]any{
 						"subscription_id":          "sub_comini_pro",
@@ -315,7 +359,7 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 		evalMap["time"] = time.Now().UnixMilli()
 	}
 
-	// Inject feature gates: Hide Images, Library, Maps ('...' more menu), while preserving Plugins
+	// Inject feature gates: Hide Images, Library, Maps ('...' more menu), while preserving Unified UI & Plugins
 	gates, _ := evalMap["feature_gates"].(map[string]any)
 	if gates == nil {
 		gates = make(map[string]any)
@@ -326,7 +370,15 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 			"rule_id": "comini_override",
 		}
 	}
-	// 3085093835: Unified mode gate (hide Images, Maps, Shopping, and '...' overflow menu in sidebar)
+	// 2200939124: ChatGPT in-app / unified mode capability gate (ME / NE in app-shared.js)
+	setGate("2200939124", true)
+	// 4039078146: Contextual sidebar rail gate (Kgi in app-shared.js)
+	setGate("4039078146", true)
+	// 1625797156: Work Cloud rollout gate (Qg in app-shared.js)
+	setGate("1625797156", true)
+	// 3538455134: Ambient usage in profile menu gate (mLs in app-shared.js)
+	setGate("3538455134", true)
+	// 3085093835: Unified mode overflow gate (hide Images, Maps, Shopping, and '...' overflow menu in sidebar)
 	setGate("3085093835", false)
 	// 224248639: File library gate (hide Library tab in sidebar)
 	setGate("224248639", false)
@@ -338,6 +390,8 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 	setGate("1008193688", false)
 	// 2357954336: Sidebar visible defaults
 	setGate("2357954336", false)
+	// 1315865107: tpp-local-executor / work.cloud-orchestration gate (disable so Local Work executor does not exit with code 1 and Cloud uses Antigravity)
+	setGate("1315865107", false)
 	// 375130565: Hosted cloud / durable executor gate (disable so local threads are not routed to cloud durable host)
 	setGate("375130565", false)
 	// 4218407052: Marketplace & plugin directory (keep ENABLED so Plugins store remains accessible)
@@ -441,10 +495,18 @@ func (h *Handlers) HandleSettingsUser(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleSettingsMutation serves PATCH/POST /settings/* mutations.
+// HandleSettingsMutation serves GET/PATCH/POST /settings/* endpoints (including /settings/is_adult).
 func (h *Handlers) HandleSettingsMutation(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+
+	if strings.HasSuffix(r.URL.Path, "/is_adult") {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"age_status":              "over_18",
+			"has_verified_age_or_dob": true,
+		})
+		return
+	}
 
 	settings := buildUserSettings()
 	feature := r.URL.Query().Get("feature")
@@ -466,6 +528,42 @@ func (h *Handlers) HandleSettingsMutation(w http.ResponseWriter, r *http.Request
 	resp["success"] = true
 	resp["settings"] = settings
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleWhamWorkSettings serves GET/PATCH /wham/work/settings (`Gre` & `PP` schema in app-shared.js).
+func (h *Handlers) HandleWhamWorkSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	var reqBody map[string]any
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&reqBody)
+	}
+	var settings any = nil
+	if s, ok := reqBody["settings"]; ok && s != nil {
+		settings = s
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"revision": 1,
+		"settings": settings,
+	})
+}
+
+// HandleWhamPredictionsConfig serves GET /wham/predictions/config (`C_e` schema in app.asar).
+func (h *Handlers) HandleWhamPredictionsConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"is_enabled": false,
+	})
+}
+
+// HandleSubscriptionsDiscountOffer serves GET /subscriptions/credits/discount-offer.
+func (h *Handlers) HandleSubscriptionsDiscountOffer(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"offer": nil,
+	})
 }
 
 // HandleMe serves GET /me (`_Mo` schema in app-initial.js).
@@ -521,44 +619,44 @@ func (h *Handlers) HandleTppModels(w http.ResponseWriter, r *http.Request) {
 		"internal_groups":    []any{},
 		"models": []map[string]any{
 			{
-				"slug":               "google-antigravity/gemini-4-argon",
-				"max_tokens":         1048576,
-				"title":              "Gemini 4 Argon",
-				"description":        "Google Antigravity Gemini 4 Argon",
-				"tags":               []string{"pro"},
-				"capabilities":       map[string]any{},
-				"product_features":   map[string]any{},
-				"enabled_tools":      []string{"tools", "canvas"},
+				"slug":             "google-antigravity/gemini-4-argon",
+				"max_tokens":       1048576,
+				"title":            "Gemini 4 Argon",
+				"description":      "Google Antigravity Gemini 4 Argon",
+				"tags":             []string{"pro"},
+				"capabilities":     map[string]any{},
+				"product_features": map[string]any{},
+				"enabled_tools":    []string{"tools", "canvas"},
 			},
 			{
-				"slug":               "google-antigravity/gemini-3.8-flash",
-				"max_tokens":         1048576,
-				"title":              "Gemini 3.8 Flash",
-				"description":        "Google Antigravity Gemini 3.8 Flash",
-				"tags":               []string{"fast"},
-				"capabilities":       map[string]any{},
-				"product_features":   map[string]any{},
-				"enabled_tools":      []string{"tools", "canvas"},
+				"slug":             "google-antigravity/gemini-3.8-flash",
+				"max_tokens":       1048576,
+				"title":            "Gemini 3.8 Flash",
+				"description":      "Google Antigravity Gemini 3.8 Flash",
+				"tags":             []string{"fast"},
+				"capabilities":     map[string]any{},
+				"product_features": map[string]any{},
+				"enabled_tools":    []string{"tools", "canvas"},
 			},
 			{
-				"slug":               "google-antigravity/claude-opus-5-5",
-				"max_tokens":         200000,
-				"title":              "Claude Opus 5.5",
-				"description":        "Anthropic Claude Opus 5.5",
-				"tags":               []string{"pro"},
-				"capabilities":       map[string]any{},
-				"product_features":   map[string]any{},
-				"enabled_tools":      []string{"tools", "canvas"},
+				"slug":             "google-antigravity/claude-opus-5-5",
+				"max_tokens":       200000,
+				"title":            "Claude Opus 5.5",
+				"description":      "Anthropic Claude Opus 5.5",
+				"tags":             []string{"pro"},
+				"capabilities":     map[string]any{},
+				"product_features": map[string]any{},
+				"enabled_tools":    []string{"tools", "canvas"},
 			},
 			{
-				"slug":               "google-antigravity/claude-sonnet-5-5",
-				"max_tokens":         200000,
-				"title":              "Claude Sonnet 5.5",
-				"description":        "Anthropic Claude Sonnet 5.5",
-				"tags":               []string{"pro"},
-				"capabilities":       map[string]any{},
-				"product_features":   map[string]any{},
-				"enabled_tools":      []string{"tools", "canvas"},
+				"slug":             "google-antigravity/claude-sonnet-5-5",
+				"max_tokens":       200000,
+				"title":            "Claude Sonnet 5.5",
+				"description":      "Anthropic Claude Sonnet 5.5",
+				"tags":             []string{"pro"},
+				"capabilities":     map[string]any{},
+				"product_features": map[string]any{},
+				"enabled_tools":    []string{"tools", "canvas"},
 			},
 		},
 		"slider_settings": []any{},
@@ -590,7 +688,6 @@ func (h *Handlers) HandleCelsiusWsUser(w http.ResponseWriter, r *http.Request) {
 		"expires_at":    time.Now().Add(time.Hour).Unix(),
 	})
 }
-
 
 func (h *Handlers) HandleEmptyObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -778,6 +875,35 @@ func (h *Handlers) HandleTrustedContactEnabled(w http.ResponseWriter, r *http.Re
 func (h *Handlers) HandleWhamAnalytics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+
+	p := r.URL.Path
+	if strings.Contains(p, "plan_limit_history") {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data_as_of":                 nil,
+			"coverage_start":             nil,
+			"coverage_complete":          true,
+			"approximate":                true,
+			"boundary_tolerance_seconds": nil,
+			"periods":                    []any{},
+		})
+		return
+	}
+	if strings.Contains(p, "plan_limit_balance_history") {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"points":      []any{},
+			"next_cursor": nil,
+			"data_as_of":  nil,
+		})
+		return
+	}
+	if strings.Contains(p, "thread_usage") {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"threads":    []any{},
+			"data_as_of": nil,
+		})
+		return
+	}
+
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data":              []any{},
 		"series":            []any{},
@@ -800,7 +926,8 @@ func (h *Handlers) HandleWhamChatpassApps(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"apps": []any{},
+		"items": []any{},
+		"apps":  []any{},
 	})
 }
 
@@ -875,6 +1002,13 @@ func (h *Handlers) HandleFallbackJSON(w http.ResponseWriter, r *http.Request) {
 		"styles":   []any{},
 		"apps":     []any{},
 		"pets":     []any{},
+		"threads":  []any{},
+		"points":   []any{},
+		"periods":  []any{},
+		"events":   []any{},
+		"settings": nil,
+		"revision": 1,
+		"offer":    nil,
 		"success":  true,
 		"cursor":   nil,
 	})
