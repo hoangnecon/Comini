@@ -45,10 +45,10 @@ func TestHandleWhamStatsigBootstrap(t *testing.T) {
 		t.Fatalf("failed to unmarshal statsigPayload: %v", err)
 	}
 
-	// 1. Verify gate 3085093835 (Unified Mode / Maps / Images / '...' menu is hidden)
+	// 1. Verify gate 3085093835 (Master gate for 2-layer Navigation Rail + Contextual Sidebar is enabled)
 	gateUnified, ok := inner.FeatureGates["3085093835"]
-	if !ok || gateUnified.Value {
-		t.Fatalf("expected feature gate 3085093835 to be false (hidden), got %+v", inner.FeatureGates["3085093835"])
+	if !ok || !gateUnified.Value {
+		t.Fatalf("expected feature gate 3085093835 to be true (enabled), got %+v", inner.FeatureGates["3085093835"])
 	}
 
 	// 2. Verify gate 224248639 (File library is hidden)

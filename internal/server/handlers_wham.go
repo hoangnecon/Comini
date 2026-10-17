@@ -378,17 +378,26 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 	setGate("1625797156", true)
 	// 3538455134: Ambient usage in profile menu gate (mLs in app-shared.js)
 	setGate("3538455134", true)
-	// 3085093835: Unified mode overflow gate (hide Images, Maps, Shopping, and '...' overflow menu in sidebar)
-	setGate("3085093835", false)
+	// 3085093835: Master gate for 2-layer Navigation Rail + Contextual Sidebar (AE / yL in app-shared.js)
+	setGate("3085093835", true)
+	// 701328431: Navigation rail destination state persistence gate (Evc in app-shared.js)
+	setGate("701328431", true)
 	// 224248639: File library gate (hide Library tab in sidebar)
 	setGate("224248639", false)
 	// 15851580: Project-level file library
 	setGate("15851580", false)
 	// 553358387: Library search & integration
 	setGate("553358387", false)
-	// 1008193688: Image Generation capability
+	// 1008193688: Shopping destination in sidebar
 	setGate("1008193688", false)
-	// 2357954336: Sidebar visible defaults
+	// 637432221: Sites destination in sidebar (FU in app-shared.js)
+	setGate("637432221", false)
+	// 2989431347: CME destination in sidebar (chatgpt.cme in app-shared.js)
+	setGate("2989431347", false)
+	// 3066066594 & 3943865271: Maps destination gates (eVs in app-shared.js)
+	setGate("3066066594", false)
+	setGate("3943865271", false)
+	// 2357954336: Health sidebar visible defaults
 	setGate("2357954336", false)
 	// 1315865107: tpp-local-executor / work.cloud-orchestration gate (disable so Local Work executor does not exit with code 1 and Cloud uses Antigravity)
 	setGate("1315865107", false)
@@ -398,7 +407,7 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 	setGate("4218407052", true)
 	evalMap["feature_gates"] = gates
 
-	// Disable layer configs (web_file_library_enabled)
+	// Disable layer configs (web_file_library_enabled & Maps auto-pin)
 	layers, _ := evalMap["layer_configs"].(map[string]any)
 	if layers == nil {
 		layers = make(map[string]any)
@@ -406,6 +415,19 @@ func (h *Handlers) HandleWhamStatsigBootstrap(w http.ResponseWriter, r *http.Req
 	layers["3017902351"] = map[string]any{
 		"value": map[string]any{
 			"web_file_library_enabled": false,
+		},
+		"rule_id": "comini_override",
+	}
+	layers["2534086513"] = map[string]any{
+		"value": map[string]any{
+			"sidebar_auto_pin_mode":  "no_maps_page",
+			"enable-local-home-page": false,
+		},
+		"rule_id": "comini_override",
+	}
+	layers["4107938382"] = map[string]any{
+		"value": map[string]any{
+			"enable-local-home-page": false,
 		},
 		"rule_id": "comini_override",
 	}
