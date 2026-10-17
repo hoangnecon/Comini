@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"testing"
 
 	"comini/internal/domain"
@@ -11,6 +12,9 @@ import (
 )
 
 func TestLiveCCAInvariants(t *testing.T) {
+	if os.Getenv("COMINI_LIVE_TESTS") != "1" {
+		t.Skip("Skipping live CCA network test (set COMINI_LIVE_TESTS=1 to run)")
+	}
 	authMgr := transport.DefaultAuthManager
 	token, proj, err := authMgr.GetCredentials()
 	if err != nil || token == "" {
@@ -212,7 +216,7 @@ func TestLiveCCAInvariants(t *testing.T) {
 					},
 				},
 			}
-			resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", body, token, proj)
+			resp, err := client.StreamGenerateContent(context.Background(), "gemini-3.8-flash-high", body, token, proj)
 			if err != nil {
 				fmt.Printf("❌ [%s] Failed: %v\n", tc.name, err)
 			} else {

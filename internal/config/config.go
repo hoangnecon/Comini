@@ -42,7 +42,7 @@ func Load() *Config {
 		Port:         port,
 		Host:         host,
 		CCABaseURL:   ccaBase,
-		DefaultModel: "gemini-3.7-flash",
+		DefaultModel: "gemini-3.8-flash",
 		UserAgent:    "antigravity",
 		StaticToken:  token,
 	}

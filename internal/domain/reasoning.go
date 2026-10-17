@@ -6,9 +6,8 @@ type ReasoningLevel struct {
 	Description string `json:"description"`
 }
 
-// DeepSeekReasoningLadder declares the 3 rungs (low, high, ultra)
-// where low & high are visible on the UI slider, and ultra is reserved for agent task delegation.
-var DeepSeekReasoningLadder = []ReasoningLevel{
+// DefaultReasoningLadder declares the 3 rungs (low, medium, high).
+var DefaultReasoningLadder = []ReasoningLevel{
 	{Effort: "low", Description: "Fast responses with lighter reasoning"},
 	{Effort: "medium", Description: "Balanced reasoning for everyday tasks"},
 	{Effort: "high", Description: "Greater reasoning depth for complex problems"},

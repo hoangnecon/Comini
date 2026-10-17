@@ -181,7 +181,46 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 				"parameters":  params,
 			})
 
-		case "web_search", "image_generation":
+		case "image_generation":
+			origName := "image_generation"
+			sanitized := "image_generation"
+			meta := domain.ToolMeta{
+				OriginalName:  origName,
+				Namespace:     ns,
+				CanonicalName: origName,
+				IsImageGen:    true,
+			}
+			metaMap[sanitized] = meta
+			metaMap[origName] = meta
+			if seenDecls[sanitized] {
+				return
+			}
+			seenDecls[sanitized] = true
+			params := map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"prompt": map[string]any{
+						"type":        "STRING",
+						"description": "The detailed visual prompt describing the image to generate.",
+					},
+					"aspect_ratio": map[string]any{
+						"type":        "STRING",
+						"description": "Aspect ratio of the generated image. Supported values: '1:1', '16:9', '4:3', '3:4', '9:16'. Defaults to '1:1'.",
+					},
+				},
+				"required": []string{"prompt"},
+			}
+			desc := t.Description
+			if desc == "" {
+				desc = "Generate high-quality images using Google Gemini Imagen model based on a descriptive text prompt. Use this tool whenever the user asks to draw, generate, paint, or create an image or illustration."
+			}
+			decls = append(decls, map[string]any{
+				"name":        sanitized,
+				"description": desc,
+				"parameters":  params,
+			})
+
+		case "web_search":
 			// Hosted server-side tools are ignored unless provided as regular functions
 			return
 
@@ -208,6 +247,7 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 				OriginalName:  origName,
 				Namespace:     ns,
 				CanonicalName: canonicalName,
+				IsImageGen:    (origName == "image_generation" || origName == "generate_image"),
 			}
 			metaMap[sanitized] = meta
 			metaMap[canonicalName] = meta

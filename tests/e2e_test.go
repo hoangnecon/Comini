@@ -41,8 +41,8 @@ func TestModelCatalogWithReasoningLadder(t *testing.T) {
 	}
 
 	pro := cat.Data[0]
-	if pro.ID != "deepseek-v4-pro" {
-		t.Fatalf("expected deepseek-v4-pro, got %s", pro.ID)
+	if pro.ID != "google-antigravity/gemini-3.8-flash" {
+		t.Fatalf("expected google-antigravity/gemini-3.8-flash, got %s", pro.ID)
 	}
 
 	// Verify supported_reasoning_levels contains 3-rung ladder (low, medium, high)
@@ -146,10 +146,20 @@ func TestResolveModelAndEffortLadder(t *testing.T) {
 		{"gemini-3.1-pro", "medium", "gemini-pro-agent", "medium"},
 		{"gemini-3.1-pro", "high", "gemini-pro-agent", "high"},
 
-		// Claude models
+		// Claude models (4.6 legacy + 5.5 active)
 		{"claude-sonnet-4-6", "low", "claude-sonnet-4-6", "low"},
 		{"claude-sonnet-4-6", "high", "claude-sonnet-4-6", "high"},
 		{"claude-opus-4-6-thinking", "high", "claude-opus-4-6-thinking", "high"},
+		{"google-antigravity/claude-sonnet-5-5", "low", "claude-sonnet-5-5-low", ""},
+		{"google-antigravity/claude-sonnet-5-5", "medium", "claude-sonnet-5-5-medium", ""},
+		{"google-antigravity/claude-sonnet-5-5", "high", "claude-sonnet-5-5-high", ""},
+		{"google-antigravity/claude-opus-5-5-thinking", "low", "claude-opus-5-5-low", ""},
+		{"google-antigravity/claude-opus-5-5-thinking", "high", "claude-opus-5-5-high", ""},
+
+		// Gemini 4 Argon (1:1 3-rung ladder matching Antigravity)
+		{"google-antigravity/gemini-4-argon", "low", "gemini-4-argon-low", ""},
+		{"google-antigravity/gemini-4-argon", "medium", "gemini-4-argon-medium", ""},
+		{"google-antigravity/gemini-4-argon", "high", "gemini-4-argon-high", ""},
 	}
 
 	for _, tc := range cases {

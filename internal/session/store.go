@@ -227,12 +227,17 @@ func (s *SignatureStore) FindAnyCall(funcName string, args any) (string, bool) {
 	defer s.mu.RUnlock()
 
 	suffix := "::" + FunctionCallKey(funcName, args)
+	var candidates []string
 	for k, sig := range s.bySessionCall {
 		if strings.HasSuffix(k, suffix) && sig != "" {
-			return sig, true
+			candidates = append(candidates, k)
 		}
 	}
-	return "", false
+	if len(candidates) == 0 {
+		return "", false
+	}
+	sort.Strings(candidates)
+	return s.bySessionCall[candidates[0]], true
 }
 
 func (s *SignatureStore) Clear() {

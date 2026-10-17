@@ -13,6 +13,9 @@ var (
 	billingHeaderRegex   = regexp.MustCompile(`(?m)^x-anthropic-billing-header:[^\n]*\n*`)
 	claudeAgentSdkRegex  = regexp.MustCompile(`(?s)You are a Claude agent, built on Anthropic's Claude Agent SDK\..*?(?:\n\n|$)`)
 	modelSwitchRegex     = regexp.MustCompile(`(?s)<model_switch>.*?</model_switch>`)
+	generatedImageRegex  = regexp.MustCompile(`(?s)\[Generated Image based on prompt:\s*".*?"(?:\.\s*Saved to:\s*.*?)?\]`)
+	leakedObsRegex       = regexp.MustCompile(`(?s)\[Observation:\s*.*?\]`)
+	imageOmittedRegex    = regexp.MustCompile(`(?s)\[Image omitted.*?\]`)
 )
 
 const (
@@ -30,6 +33,9 @@ func SanitizeMessageText(text string) string {
 	cleaned = claudeAgentSdkRegex.ReplaceAllString(cleaned, "")
 	cleaned = codexGPT5Regex.ReplaceAllString(cleaned, neutralIdentity)
 	cleaned = codexBrandRegex.ReplaceAllString(cleaned, "# Desktop client context")
+	cleaned = generatedImageRegex.ReplaceAllString(cleaned, "")
+	cleaned = leakedObsRegex.ReplaceAllString(cleaned, "")
+	cleaned = imageOmittedRegex.ReplaceAllString(cleaned, "")
 	return strings.TrimSpace(cleaned)
 }
 

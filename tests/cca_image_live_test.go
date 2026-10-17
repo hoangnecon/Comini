@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"testing"
 
 	"comini/internal/domain"
@@ -12,6 +14,9 @@ import (
 )
 
 func TestLiveCCAImageAnalysis(t *testing.T) {
+	if os.Getenv("COMINI_LIVE_TESTS") != "1" {
+		t.Skip("Skipping live CCA network test (set COMINI_LIVE_TESTS=1 to run)")
+	}
 	authMgr := transport.DefaultAuthManager
 	token, proj, err := authMgr.GetCredentials()
 	if err != nil || token == "" {
@@ -61,27 +66,27 @@ func TestLiveCCAImageAnalysis(t *testing.T) {
 	respStr := string(respBytes)
 	fmt.Printf("Live CCA Response: %s\n", respStr)
 
-	// Test 2: gemini-3.7-flash-high with thinkingConfig
-	body37 := domain.GeminiWireBody{
+	// Test 2: gemini-3.8-flash-high
+	body38 := domain.GeminiWireBody{
 		Contents: body.Contents,
-		GenerationConfig: &domain.GeminiGenerationConfig{
-			ThinkingConfig: &domain.GeminiThinkingConfig{
-				ThinkingLevel:   "high",
-				IncludeThoughts: true,
-			},
-		},
 	}
-	resp37, err := client.StreamGenerateContent(context.Background(), "gemini-3.7-flash-high", body37, token, proj)
+	resp38, err := client.StreamGenerateContent(context.Background(), "gemini-3.8-flash-high", body38, token, proj)
 	if err != nil {
-		t.Fatalf("CCA request 3.7 failed: %v", err)
+		if strings.Contains(err.Error(), "429") {
+			t.Skipf("Live quota temporarily exhausted for 3.8: %v", err)
+		}
+		t.Fatalf("CCA request 3.8 failed: %v", err)
 	}
-	defer resp37.Body.Close()
+	defer resp38.Body.Close()
 
-	resp37Bytes, _ := io.ReadAll(resp37.Body)
-	fmt.Printf("Live CCA 3.7 Response: %s\n", string(resp37Bytes))
+	resp38Bytes, _ := io.ReadAll(resp38.Body)
+	fmt.Printf("Live CCA 3.8 Response: %s\n", string(resp38Bytes))
 }
 
 func TestProbeAllCCAModelIDs(t *testing.T) {
+	if os.Getenv("COMINI_LIVE_TESTS") != "1" {
+		t.Skip("Skipping live CCA network test (set COMINI_LIVE_TESTS=1 to run)")
+	}
 	authMgr := transport.DefaultAuthManager
 	token, proj, err := authMgr.GetCredentials()
 	if err != nil || token == "" {
@@ -94,12 +99,11 @@ func TestProbeAllCCAModelIDs(t *testing.T) {
 		"gemini-3.8-flash-high",
 		"gemini-3.8-flash-medium",
 		"gemini-3.8-flash-low",
-		"gemini-3.7-flash-high",
-		"gemini-pro-agent",
-		"gemini-3.1-pro-low",
-		"gemini-3.1-flash-image",
-		"claude-sonnet-4-6",
-		"claude-opus-4-6-thinking",
+		"gemini-4-argon-high",
+		"gemini-4-argon-medium",
+		"gemini-4-argon-low",
+		"claude-sonnet-5-5-high",
+		"claude-opus-5-5-high",
 		"gpt-oss-120b-medium",
 	}
 

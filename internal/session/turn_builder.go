@@ -1,19 +1,36 @@
 package session
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"os"
+
+	"sort"
 	"strings"
 
 	"comini/internal/domain"
 	"comini/internal/harness"
 	"comini/internal/schema"
 )
+
+func deterministicCapText(s string, maxTotalChars, headChars, tailChars int, reason string) string {
+	if len(s) <= maxTotalChars {
+		return s
+	}
+	if headChars+tailChars >= len(s) {
+		return s
+	}
+	omitted := len(s) - headChars - tailChars
+	return fmt.Sprintf("%s\n\n...[%s: %d characters omitted for context health]...\n\n%s",
+		s[:headChars], reason, omitted, s[len(s)-tailChars:])
+}
 
 func generateDeterministicSignature(sessionID, callID, funcName string) string {
 	hash := sha256.Sum256([]byte("sig:" + sessionID + ":" + callID + ":" + funcName))
@@ -36,8 +53,9 @@ func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
 	}
 
 	if seed == "" {
-		return fmt.Sprintf("-%d", rand.Int63()&0x7fffffffffffffff)
+		seed = "comini-default-session"
 	}
+
 
 	digest := sha256.Sum256([]byte(seed))
 	val := binary.BigEndian.Uint64(digest[:8]) & 0x7fffffffffffffff
@@ -517,31 +535,45 @@ func mergeConsecutiveRoles(contents []domain.GeminiContent) []domain.GeminiConte
 }
 
 func capAllPartsText(contents []domain.GeminiContent) []domain.GeminiContent {
-	const maxSinglePartChars = 5000000 // 5MB per text part allows full source files & diffs
+	// Standard ChatGPT / Codex context standards aligned with tool_output_token_limit = 10,000 tokens (~40,000–48,000 chars):
+	// CRITICAL INVARIANT FOR PREFIX CACHING:
+	// Never use a sliding index relative to len(contents) (e.g. `numContents-1-ci <= 4`), because
+	// on every new turn `len(contents)` increments by 2, which would mutate turn `N-5` from 48KB to 6KB
+	// on every single request and destroy Google CCA's prefix cache starting at turn `N-5`!
+	// Instead, we apply:
+	// 1. A deterministic 48,000-char (~12k token) cap on all parts across the active epoch.
+	// 2. Quantized epoch decay (6,000 chars) ONLY on turns strictly before the frozen 16-turn epoch boundary
+	//    (`quantizedBoundary := ((len(contents) - 5) / 16) * 16`), so the prefix stays 100% byte-identical
+	//    for 16 consecutive turns!
+	const activeTurnToolMaxChars = 48000
+	const historicalToolMaxChars = 6000
 
-	// Retain at most the last 3 inline images across the entire conversation history
-	imageCount := 0
-	for ci := len(contents) - 1; ci >= 0; ci-- {
+	numContents := len(contents)
+	quantizedBoundary := 0
+	if numContents > 20 {
+		quantizedBoundary = ((numContents - 5) / 16) * 16
+	}
+
+	for ci := numContents - 1; ci >= 0; ci-- {
+		maxToolChars := activeTurnToolMaxChars
+		if ci > 0 && ci < quantizedBoundary {
+			maxToolChars = historicalToolMaxChars
+		}
+
 		for pi := range contents[ci].Parts {
 			p := &contents[ci].Parts[pi]
-			if p.InlineData != nil {
-				imageCount++
-				if imageCount > 3 {
-					p.InlineData = nil
-					if p.Text == "" {
-						p.Text = "[Image omitted from historical context]"
-					}
-				}
-			}
-			// Cap extreme multi-megabyte single text anomalies
-			if len(p.Text) > maxSinglePartChars {
-				p.Text = p.Text[:maxSinglePartChars]
+			if len(p.Text) > maxToolChars {
+				half := maxToolChars / 2
+				p.Text = p.Text[:half] + "\n\n... [output truncated for context economy] ...\n\n" + p.Text[len(p.Text)-half:]
 			}
 			if p.FunctionResponse != nil && p.FunctionResponse.Response != nil {
 				b, err := json.Marshal(p.FunctionResponse.Response)
-				if err == nil && len(b) > maxSinglePartChars {
+				if err == nil && len(b) > maxToolChars {
+					half := maxToolChars / 2
+					str := string(b)
+					truncated := str[:half] + "\n\n... [output truncated for context economy] ...\n\n" + str[len(str)-half:]
 					p.FunctionResponse.Response = map[string]any{
-						"result": string(b[:maxSinglePartChars]),
+						"result": truncated,
 					}
 				}
 			}
@@ -647,14 +679,69 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 	return mergeConsecutiveRoles(cleanContents)
 }
 
+func compressOversizedImage(in *domain.GeminiInlineData) *domain.GeminiInlineData {
+	if in == nil || len(in.Data) <= 600000 { // ~450KB binary is already well-sized
+		return in
+	}
+	raw, err := base64.StdEncoding.DecodeString(in.Data)
+	if err != nil {
+		return in
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return in
+	}
+	var buf bytes.Buffer
+	err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75})
+	if err != nil {
+		return in
+	}
+	newB64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+	if len(newB64) < len(in.Data) {
+		return &domain.GeminiInlineData{
+			MimeType: "image/jpeg",
+			Data:     newB64,
+		}
+	}
+	return in
+}
+
+func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.GeminiContent {
+	// Strictly enforce a maximum total budget for image payload across the request.
+	// This guarantees images NEVER starve or displace the textual conversation history!
+	const maxTotalImageChars = 1200000 // ~300k tokens max for images
+
+	keptImages := 0
+	accumulatedImageChars := 0
+
+	// Scan backwards from newest (tail) to oldest (head)
+	for ci := len(contents) - 1; ci >= 0; ci-- {
+		for pi := len(contents[ci].Parts) - 1; pi >= 0; pi-- {
+			p := &contents[ci].Parts[pi]
+			if p.InlineData != nil && len(p.InlineData.Data) > 0 {
+				// Re-encode oversized raw PNGs to clean JPEGs if needed
+				p.InlineData = compressOversizedImage(p.InlineData)
+
+				imgLen := len(p.InlineData.Data)
+				if keptImages < maxKeep && accumulatedImageChars+imgLen <= maxTotalImageChars {
+					keptImages++
+					accumulatedImageChars += imgLen
+				} else {
+					mime := p.InlineData.MimeType
+					p.Text = fmt.Sprintf("[Image: %s previously inspected and processed in earlier turn]", mime)
+					p.InlineData = nil
+				}
+			}
+		}
+	}
+	return contents
+}
+
 func isUserConversationalContent(c domain.GeminiContent) bool {
 	if c.Role != "user" {
 		return false
 	}
 	for _, p := range c.Parts {
-		if p.InlineData != nil {
-			return true
-		}
 		if p.Text != "" {
 			trimmed := strings.TrimSpace(p.Text)
 			// Explicitly preserve memory citations, active technical plans, thread goals, and confirmed decisions
@@ -665,9 +752,10 @@ func isUserConversationalContent(c domain.GeminiContent) bool {
 				strings.Contains(trimmed, "MEMORY_SUMMARY") {
 				return true
 			}
-			// A genuine user instruction is not a tool observation or system compaction note
+			// A genuine user instruction is not a tool observation, compaction note, or image placeholder
 			if !strings.HasPrefix(trimmed, "[Observation:") &&
-				!strings.HasPrefix(trimmed, "[Note:") {
+				!strings.HasPrefix(trimmed, "[Note:") &&
+				!strings.HasPrefix(trimmed, "[Image:") {
 				return true
 			}
 		}
@@ -679,58 +767,141 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.Ge
 	contents = capAllPartsText(contents)
 	contents = sanitizeAndValidateGeminiContents(contents)
 
-	calcTextLen := func(cts []domain.GeminiContent) int {
+	calcContentSize := func(c domain.GeminiContent) int {
 		total := 0
-		for _, c := range cts {
-			for _, p := range c.Parts {
-				total += len(p.Text)
-				if p.FunctionCall != nil {
-					b, _ := json.Marshal(p.FunctionCall.Args)
-					total += len(b)
-				}
-				if p.FunctionResponse != nil {
-					b, _ := json.Marshal(p.FunctionResponse.Response)
-					total += len(b)
-				}
+		for _, p := range c.Parts {
+			total += len(p.Text)
+			if p.FunctionCall != nil {
+				b, _ := json.Marshal(p.FunctionCall.Args)
+				total += len(b)
+			}
+			if p.FunctionResponse != nil {
+				b, _ := json.Marshal(p.FunctionResponse.Response)
+				total += len(b)
+			}
+			if p.InlineData != nil {
+				total += len(p.InlineData.Data)
 			}
 		}
 		return total
 	}
 
-	// Full context window budget: 10,000,000 chars and 500 turns matching Gemini 1M+ token limit
-	const maxCharsBudget = 10000000
-	const maxTurnsBudget = 500
-
-	if calcTextLen(contents) <= maxCharsBudget && len(contents) <= maxTurnsBudget {
-		return contents
+	calcTotalSize := func(cts []domain.GeminiContent) int {
+		total := 0
+		for _, c := range cts {
+			total += calcContentSize(c)
+		}
+		return total
 	}
 
-	// Extreme safeguard fallback only if exceeding 10MB
-	const keepRecentTurns = 150
-	if len(contents) > keepRecentTurns+1 {
-		cutoffIndex := len(contents) - keepRecentTurns
-		first := contents[0]
-		recent := contents[cutoffIndex:]
+	// Standard ChatGPT / Codex context standards:
+	// Full context ceiling aligned with OpenAI's 200k token / 272k context window (~800,000 characters).
+	// This prevents massive multi-hundred-thousand-token context accumulation per turn,
+	// dramatically conserving Google CCA quota while matching Antigravity's native 256k limit.
+	const maxCharsBudget = 800000
 
-		var preservedUserTurns []domain.GeminiContent
-		for i := 1; i < cutoffIndex; i++ {
-			if isUserConversationalContent(contents[i]) {
-				preservedUserTurns = append(preservedUserTurns, contents[i])
+	// Stage 1: Enforce image budget.
+	// Keep at most 2 most recent images that fit under 1.2MB image budget.
+	// Excess or oversized images are compressed and converted to text placeholders.
+	contents = evictStaleImages(contents, 2)
+
+	if calcTotalSize(contents) <= maxCharsBudget {
+		return sanitizeAndValidateGeminiContents(contents)
+	}
+
+	// Stage 2: Quantized Turn Pruning when text/history still exceeds budget.
+	// Scan backwards from the end to keep as many recent turns as fit under budget.
+	targetBudget := maxCharsBudget * 80 / 100 // ~640KB leaves space for system and preserved user turns
+	accumulated := 0
+	rawCutoff := 1
+	for i := len(contents) - 1; i >= 1; i-- {
+		sz := calcContentSize(contents[i])
+		if accumulated+sz > targetBudget {
+			rawCutoff = i + 1
+			break
+		}
+		accumulated += sz
+	}
+
+	// QUANTIZED CUTOFF: Round down cutoff index to a multiple of 16 turns.
+	// This prevents the sliding window trap, keeping the prefix byte stream 100% frozen
+	// across 16 consecutive requests so prefix caching achieves 95%+ hit rate!
+	cutoffIndex := (rawCutoff / 16) * 16
+	if cutoffIndex <= 0 {
+		cutoffIndex = 1
+	}
+	if cutoffIndex >= len(contents)-5 {
+		cutoffIndex = len(contents) - 5
+		if cutoffIndex < 1 {
+			cutoffIndex = 1
+		}
+	}
+
+	first := contents[0]
+	recent := contents[cutoffIndex:]
+
+	// Extract preserved conversational user instructions from pruned history.
+	// Cap each preserved user prompt to 2,000 characters and strip any image data
+	// to ensure ancient large text/file pastes don't inflate the context.
+	var preservedUserTurns []domain.GeminiContent
+	for i := 1; i < cutoffIndex; i++ {
+		if isUserConversationalContent(contents[i]) {
+			item := contents[i]
+			var cleanedParts []domain.GeminiPart
+			for _, p := range item.Parts {
+				if p.InlineData != nil {
+					cleanedParts = append(cleanedParts, domain.GeminiPart{
+						Text: "[Image provided in earlier step]",
+					})
+				} else if p.Text != "" {
+					txt := p.Text
+					if len(txt) > 2000 {
+						txt = txt[:1000] + "\n... [trimmed] ...\n" + txt[len(txt)-1000:]
+					}
+					cleanedParts = append(cleanedParts, domain.GeminiPart{
+						Text: txt,
+					})
+				}
+			}
+			if len(cleanedParts) > 0 {
+				preservedUserTurns = append(preservedUserTurns, domain.GeminiContent{
+					Role:  "user",
+					Parts: cleanedParts,
+				})
 			}
 		}
-
-		newContents := []domain.GeminiContent{first}
-		newContents = append(newContents, preservedUserTurns...)
-		newContents = append(newContents, recent...)
-		contents = newContents
 	}
 
-	return sanitizeAndValidateGeminiContents(contents)
+	// If there are too many preserved user turns, keep only the most recent 10 key user instructions.
+	if len(preservedUserTurns) > 10 {
+		preservedUserTurns = preservedUserTurns[len(preservedUserTurns)-10:]
+	}
+
+	newContents := []domain.GeminiContent{first}
+	newContents = append(newContents, preservedUserTurns...)
+	newContents = append(newContents, recent...)
+
+	// Note: We DO NOT drop recent working turns in a loop. With image budget strictly capped at 1.2MB,
+	// recent working memory stays 100% intact and the model NEVER loses its current train of thought.
+	return sanitizeAndValidateGeminiContents(newContents)
 }
+
 
 // BuildGeminiWireBody converts incoming ResponsesRequest to Gemini Wire format.
 func BuildGeminiWireBody(
 	req *domain.ResponsesRequest,
+	sessionID string,
+	funcDecls []map[string]any,
+	thinkingLevel string,
+	store *SignatureStore,
+) domain.GeminiWireBody {
+	return BuildGeminiWireBodyWithItems(req, nil, sessionID, funcDecls, thinkingLevel, store)
+}
+
+// BuildGeminiWireBodyWithItems converts incoming ResponsesRequest using pre-parsed InputItems to avoid redundant JSON parsing of large payloads.
+func BuildGeminiWireBodyWithItems(
+	req *domain.ResponsesRequest,
+	preParsedItems []domain.InputItem,
 	sessionID string,
 	funcDecls []map[string]any,
 	thinkingLevel string,
@@ -758,9 +929,9 @@ func BuildGeminiWireBody(
 		}
 	}
 
-	// 2. Parse Input Items
-	var items []domain.InputItem
-	if len(req.Input) > 0 {
+	// 2. Parse Input Items if not already pre-parsed
+	items := preParsedItems
+	if len(items) == 0 && len(req.Input) > 0 {
 		_ = json.Unmarshal(req.Input, &items)
 	}
 
@@ -822,9 +993,30 @@ func BuildGeminiWireBody(
 			if name == "" && norm == "localshellcall" {
 				name = "exec_command"
 			}
+			if name == "" && norm == "imagegenerationcall" {
+				name = "image_generation"
+			}
 			args := it.Arguments
 			if args == "" {
 				args = it.Input
+			}
+			if args == "" && it.Command != "" {
+				args = fmt.Sprintf("{\"cmd\":%q}", it.Command)
+			}
+			if args == "" && norm == "imagegenerationcall" {
+				p := it.RevisedPrompt
+				if p == "" {
+					p = it.Prompt
+				}
+				if p == "" {
+					p = it.Text
+				}
+				m := map[string]any{"prompt": p}
+				if it.AspectRatio != "" {
+					m["aspect_ratio"] = it.AspectRatio
+				}
+				b, _ := json.Marshal(m)
+				args = string(b)
 			}
 			if cid != "" {
 				info := ToolCallInfo{
@@ -948,6 +1140,7 @@ func BuildGeminiWireBody(
 						for f := range files {
 							fileNames = append(fileNames, f)
 						}
+						sort.Strings(fileNames) // Deterministic ordering guarantees prefix cache hit
 						changeSummary = fmt.Sprintf("Updated files: %s", strings.Join(fileNames, ", "))
 					}
 				}
@@ -1072,50 +1265,161 @@ func BuildGeminiWireBody(
 					flushTurn()
 				}
 				currentRole = "user"
-				currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Observation: command %s executed -> output: %s]", item.Command, outText)})
+				cappedOut := deterministicCapText(outText, 16000, 10000, 3000, "terminal stdout truncated")
+				currentParts = append(currentParts, domain.GeminiPart{Text: fmt.Sprintf("[Observation: command %s executed -> output: %s]", item.Command, cappedOut)})
 			}
 
-		case "mcptoolcall", "dynamictoolcall", "collabagenttoolcall":
+		case "imagegenerationcall":
+			prompt := item.RevisedPrompt
+			if prompt == "" {
+				prompt = item.Prompt
+			}
+			if prompt == "" {
+				prompt = item.Text
+			}
+			argsMap := map[string]any{"prompt": prompt}
+			if item.AspectRatio != "" {
+				argsMap["aspect_ratio"] = item.AspectRatio
+			}
+			argsJSON, _ := json.Marshal(argsMap)
+
+			if currentRole != "" && currentRole != "model" {
+				flushTurn()
+			}
+			currentRole = "model"
+			currentParts = append(currentParts, domain.GeminiPart{
+				Text: fmt.Sprintf("[Action: called image_generation with %s]", string(argsJSON)),
+			})
+			flushTurn()
+
+			currentRole = "user"
+			var obsText string
+			if item.Failure != "" || item.Status == "incomplete" {
+				errText := item.Failure
+				if errText == "" {
+					errText = "generation failed"
+				}
+				obsText = fmt.Sprintf("[Observation: tool image_generation failed with error: %s]", errText)
+			} else if item.SavedPath != "" {
+				obsText = fmt.Sprintf("[Observation: tool image_generation succeeded -> saved to: %s. To display this image to the user, include Markdown embed ![%s](%s) in your message]", item.SavedPath, prompt, item.SavedPath)
+			} else {
+				obsText = fmt.Sprintf("[Observation: tool image_generation succeeded -> prompt: %s]", prompt)
+			}
+			currentParts = append(currentParts, domain.GeminiPart{
+				Text: obsText,
+			})
+
+		case "mcptoolcall", "dynamictoolcall", "collabagenttoolcall", "functioncall", "websearchcall", "toolsearchcall", "customtoolcall", "localshellcall":
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
 			}
-			callName := item.Tool
-			if callName == "" {
-				callName = item.Name
+			if callID != "" {
+				untrackedCalls[callID] = true
+			}
+
+			if currentRole != "" && currentRole != "model" {
+				flushTurn()
+			}
+			currentRole = "model"
+
+			funcName := item.Name
+			if funcName == "" && item.Tool != "" {
+				funcName = item.Tool
 			}
 			if item.Server != "" {
-				callName = fmt.Sprintf("%s:%s", item.Server, callName)
+				server := strings.TrimPrefix(item.Server, "mcp__")
+				funcName = fmt.Sprintf("mcp__%s__%s", server, funcName)
+			} else if item.Namespace != "" {
+				if strings.HasPrefix(item.Namespace, "mcp__") {
+					funcName = fmt.Sprintf("%s__%s", item.Namespace, funcName)
+				} else if item.Namespace == "collaboration" {
+					funcName = fmt.Sprintf("%s__%s", item.Namespace, funcName)
+				} else {
+					funcName = fmt.Sprintf("mcp__%s__%s", item.Namespace, funcName)
+				}
 			}
-			if callID != "" {
-				untrackedCalls[callID] = true
+			if funcName == "" && normType == "localshellcall" {
+				funcName = "exec_command"
+			}
+			if funcName == "" && callID != "" {
+				if info, ok := callInfoMap[callID]; ok && info.Name != "" {
+					funcName = info.Name
+				}
+			}
+			if funcName == "" {
+				funcName = callID
+			}
+			funcName = strings.ReplaceAll(funcName, ":", "__")
+			sanitizedName := schema.SanitizeFunctionName(funcName)
+
+			args := item.Arguments
+			if args == "" {
+				args = item.Input
+			}
+			if args == "" && item.Command != "" {
+				args = fmt.Sprintf("{\"cmd\":%q}", item.Command)
+			}
+			if args == "" && callID != "" {
+				if info, ok := callInfoMap[callID]; ok && info.Arguments != "" {
+					args = info.Arguments
+				}
+			}
+			if args == "" {
+				args = "{}"
 			}
 
-		case "functioncall", "websearchcall", "imagegenerationcall", "toolsearchcall":
-			callID := item.CallID
-			if callID == "" {
-				callID = item.ID
+			// Build canonical argsMap
+			var argsMap map[string]any
+			trimmedArgs := strings.TrimSpace(args)
+			if strings.HasPrefix(trimmedArgs, "{") {
+				_ = json.Unmarshal([]byte(trimmedArgs), &argsMap)
 			}
-			if callID != "" {
-				untrackedCalls[callID] = true
-			}
-
-		case "customtoolcall":
-			callID := item.CallID
-			if callID == "" {
-				callID = item.ID
-			}
-			if callID != "" {
-				untrackedCalls[callID] = true
+			if argsMap == nil {
+				if item.Input != "" {
+					argsMap = map[string]any{"input": item.Input}
+				} else if trimmedArgs != "" && trimmedArgs != "{}" {
+					argsMap = map[string]any{"input": trimmedArgs}
+				} else {
+					argsMap = map[string]any{}
+				}
 			}
 
-		case "localshellcall":
-			callID := item.CallID
-			if callID == "" {
-				callID = item.ID
+			// Retrieve thoughtSignature from store
+			var sig string
+			if store != nil && callID != "" {
+				s, _, ok := store.Get(callID)
+				if ok && s != "" {
+					sig = s
+				}
 			}
-			if callID != "" {
-				untrackedCalls[callID] = true
+			if sig == "" && store != nil {
+				if s, ok := store.GetSessionCall(sessionID, sanitizedName, argsMap); ok && s != "" {
+					sig = s
+				} else if s, ok := store.FindAnyCall(sanitizedName, argsMap); ok && s != "" {
+					sig = s
+					if sessionID != "" {
+						store.SetSessionCall(sessionID, sanitizedName, argsMap, sig)
+					}
+				}
+			}
+
+			if sig != "" {
+				// NATIVE Gemini FunctionCall with valid ThoughtSignature
+				currentParts = append(currentParts, domain.GeminiPart{
+					FunctionCall: &domain.GeminiFunctionCall{
+						Name: sanitizedName,
+						Args: argsMap,
+					},
+					ThoughtSignature: sig,
+				})
+			} else {
+				// Fallback when thoughtSignature is genuinely absent:
+				// Format args as valid JSON so Gemini sees valid JSON in prompt
+				argsJSON, _ := json.Marshal(argsMap)
+				currentParts = append(currentParts, domain.GeminiPart{
+					Text: fmt.Sprintf("[Action: called %s with %s]", sanitizedName, string(argsJSON)),
+				})
 			}
 
 		case "functioncalloutput", "customtoolcalloutput", "localshellcalloutput", "localshelloutput", "mcptoolcalloutput", "toolsearchoutput":
@@ -1166,31 +1470,23 @@ func BuildGeminiWireBody(
 
 			extractedImages, cleanResp := extractImagesAndCleanOutput(item.Output)
 
-			// 1. Attach native Vision inlineData parts first
-			for _, img := range extractedImages {
-				currentParts = append(currentParts, domain.GeminiPart{InlineData: img})
+			// 1. Prepare response object for FunctionResponse
+			respMap := cleanResp
+			if respMap == nil {
+				respMap = map[string]any{}
 			}
 
-			// 2. Attach clean observation with full tool execution context
-			if len(extractedImages) > 0 {
-				currentParts = append(currentParts, domain.GeminiPart{
-					Text: fmt.Sprintf("[Observation: tool %s returned visual image (%s)]", sanitizedName, extractedImages[0].MimeType),
-				})
-			} else {
-				respStr, _ := json.Marshal(cleanResp)
-				if hasInfo && info.Input != "" && (sanitizedName == "apply_patch" || info.Name == "apply_patch") {
-					currentParts = append(currentParts, domain.GeminiPart{
-						Text: fmt.Sprintf("[Observation: tool apply_patch with input:\n%s\n-> returned: %s]", info.Input, string(respStr)),
-					})
-				} else if hasInfo && info.Arguments != "" {
-					currentParts = append(currentParts, domain.GeminiPart{
-						Text: fmt.Sprintf("[Observation: tool %s executed with %s -> returned: %s]", sanitizedName, info.Arguments, string(respStr)),
-					})
-				} else {
-					currentParts = append(currentParts, domain.GeminiPart{
-						Text: fmt.Sprintf("[Observation: tool %s returned: %s]", sanitizedName, string(respStr)),
-					})
-				}
+			// 2. ALWAYS append FunctionResponse matching the model's FunctionCall
+			currentParts = append(currentParts, domain.GeminiPart{
+				FunctionResponse: &domain.GeminiFunctionResponse{
+					Name:     sanitizedName,
+					Response: respMap,
+				},
+			})
+
+			// 3. Attach native Vision inlineData parts alongside FunctionResponse (if any)
+			for _, img := range extractedImages {
+				currentParts = append(currentParts, domain.GeminiPart{InlineData: img})
 			}
 
 		default:

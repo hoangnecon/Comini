@@ -1,6 +1,9 @@
 package domain
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type ResponsesRequest struct {
 	Model              string                 `json:"model"`
@@ -38,6 +41,7 @@ type ToolMeta struct {
 	CanonicalName string
 	IsCustom      bool
 	IsToolSearch  bool
+	IsImageGen    bool
 }
 
 type InputItem struct {
@@ -63,6 +67,14 @@ type InputItem struct {
 	Stderr           string           `json:"stderr,omitempty"`
 	Goal             string           `json:"goal,omitempty"`
 	Summary          json.RawMessage  `json:"summary,omitempty"`
+	RevisedPrompt    string           `json:"revised_prompt,omitempty"`
+	Result           string           `json:"result,omitempty"`
+	SavedPath        string           `json:"saved_path,omitempty"`
+	Prompt           string           `json:"prompt,omitempty"`
+	Status           string           `json:"status,omitempty"`
+	Failure          string           `json:"failure,omitempty"`
+	AspectRatio      string           `json:"aspect_ratio,omitempty"`
+	Effort           string           `json:"effort,omitempty"`
 }
 
 func (i *InputItem) UnmarshalJSON(data []byte) error {
@@ -73,6 +85,11 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 		AltAggregatedOutput string          `json:"aggregatedOutput"`
 		AltThreadGoal       string          `json:"thread_goal"`
 		AltCmd              string          `json:"cmd"`
+		AltRevisedPrompt    string          `json:"revisedPrompt"`
+		AltSavedPath        string          `json:"savedPath"`
+		AltStatus           string          `json:"status"`
+		AltFailure          string          `json:"failure"`
+		AltAspectRatio      string          `json:"aspectRatio"`
 		RawArgs             json.RawMessage `json:"arguments"`
 		RawInput            json.RawMessage `json:"input"`
 	}{
@@ -80,6 +97,15 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 	}
 	if err := json.Unmarshal(data, aux); err != nil {
 		return err
+	}
+	if i.Status == "" && aux.AltStatus != "" {
+		i.Status = aux.AltStatus
+	}
+	if i.Failure == "" && aux.AltFailure != "" {
+		i.Failure = aux.AltFailure
+	}
+	if i.AspectRatio == "" && aux.AltAspectRatio != "" {
+		i.AspectRatio = aux.AltAspectRatio
 	}
 	if i.CallID == "" && aux.AltCallID != "" {
 		i.CallID = aux.AltCallID
@@ -92,6 +118,12 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 	}
 	if i.Command == "" && aux.AltCmd != "" {
 		i.Command = aux.AltCmd
+	}
+	if i.RevisedPrompt == "" && aux.AltRevisedPrompt != "" {
+		i.RevisedPrompt = aux.AltRevisedPrompt
+	}
+	if i.SavedPath == "" && aux.AltSavedPath != "" {
+		i.SavedPath = aux.AltSavedPath
 	}
 	if i.Arguments == "" && len(aux.RawArgs) > 0 {
 		var s string
@@ -109,6 +141,19 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 			i.Input = string(aux.RawInput)
 		}
 	}
+
+	// Immediate Heap Optimization: Strip large image dataURL / base64 from Result.
+	// Codex Desktop stores 1MB-1.5MB base64 JPEG in `result` for each image_generation_call.
+	// Comini uses SavedPath, Prompt, and RevisedPrompt; Result is never transmitted to Gemini.
+	// Clearing it here frees ~50MB-150MB of RAM per turn immediately upon unmarshaling.
+	if len(i.Result) > 500 && (strings.HasPrefix(i.Result, "data:image/") ||
+		strings.HasPrefix(i.Result, "/9j/") ||
+		strings.HasPrefix(i.Result, "iVBORw0KGgo") ||
+		strings.HasPrefix(i.Result, "UklGR") ||
+		strings.HasPrefix(i.Result, "R0lGOD")) {
+		i.Result = ""
+	}
+
 	return nil
 }
 
