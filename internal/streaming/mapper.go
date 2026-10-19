@@ -75,6 +75,8 @@ func MapGeminiStreamToResponses(
 
 	var currentReasoningID string
 	var reasoningIndex int
+	var currentThoughtMsgID string
+	var thoughtMsgIndex int
 	var accumulatedReasoning strings.Builder
 
 	var currentMessageID string
@@ -112,60 +114,107 @@ func MapGeminiStreamToResponses(
 	}
 
 	closeReasoning := func() {
-		if currentReasoningID == "" {
+		if currentReasoningID == "" && currentThoughtMsgID == "" {
 			return
 		}
 		fullReasoning := accumulatedReasoning.String()
 
-		// 1. Done event for reasoning summary text
-		emitSSE("response.reasoning_summary_text.done", map[string]any{
-			"output_index":  reasoningIndex,
-			"item_id":       currentReasoningID,
-			"summary_index": 0,
-			"text":          fullReasoning,
-		})
+		if currentThoughtMsgID != "" {
+			emitSSE("response.output_text.done", map[string]any{
+				"output_index":  thoughtMsgIndex,
+				"item_id":       currentThoughtMsgID,
+				"content_index": 0,
+				"text":          fullReasoning,
+			})
 
-		// 2. Done event for reasoning summary part
-		emitSSE("response.reasoning_summary_part.done", map[string]any{
-			"output_index":  reasoningIndex,
-			"item_id":       currentReasoningID,
-			"summary_index": 0,
-			"part": map[string]any{
-				"type": "summary_text",
-				"text": fullReasoning,
-			},
-		})
+			emitSSE("response.content_part.done", map[string]any{
+				"output_index":  thoughtMsgIndex,
+				"item_id":       currentThoughtMsgID,
+				"content_index": 0,
+				"part": map[string]any{
+					"type":        "output_text",
+					"text":        fullReasoning,
+					"annotations": []any{},
+				},
+			})
 
-		reasoningItem := map[string]any{
-			"id":      currentReasoningID,
-			"type":    "reasoning",
-			"status":  "completed",
-			"summary": []any{
-				map[string]any{
+			thoughtMsgItem := map[string]any{
+				"id":     currentThoughtMsgID,
+				"type":   "message",
+				"role":   "assistant",
+				"phase":  "commentary",
+				"status": "completed",
+				"content": []any{
+					map[string]any{
+						"type":        "output_text",
+						"text":        fullReasoning,
+						"annotations": []any{},
+					},
+				},
+			}
+			completedOutputItems = append(completedOutputItems, thoughtMsgItem)
+
+			emitSSE("response.output_item.done", map[string]any{
+				"output_index": thoughtMsgIndex,
+				"item":         thoughtMsgItem,
+			})
+			currentThoughtMsgID = ""
+		}
+
+		if currentReasoningID != "" {
+			// 1. Done event for reasoning summary text
+			emitSSE("response.reasoning_summary_text.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"text":          fullReasoning,
+			})
+
+			// 2. Done event for reasoning summary part
+			emitSSE("response.reasoning_summary_part.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"part": map[string]any{
 					"type": "summary_text",
 					"text": fullReasoning,
 				},
-			},
-			"content": []any{
-				map[string]any{
-					"type": "reasoning_text",
-					"text": fullReasoning,
+			})
+
+			reasoningItem := map[string]any{
+				"id":     currentReasoningID,
+				"type":   "reasoning",
+				"status": "completed",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": fullReasoning,
+					},
 				},
-			},
+				"content": []any{
+					map[string]any{
+						"type": "reasoning_text",
+						"text": fullReasoning,
+					},
+				},
+			}
+			completedOutputItems = append(completedOutputItems, reasoningItem)
+
+			emitSSE("response.output_item.done", map[string]any{
+				"output_index": reasoningIndex,
+				"item":         reasoningItem,
+			})
+			currentReasoningID = ""
 		}
-		completedOutputItems = append(completedOutputItems, reasoningItem)
 
-		emitSSE("response.output_item.done", map[string]any{
-			"output_index": reasoningIndex,
-			"item":         reasoningItem,
-		})
-
-		currentReasoningID = ""
 		accumulatedReasoning.Reset()
 		flushSSE()
 	}
 
-	closeMessage := func() {
+	closeMessage := func(phase string) {
+		if phase == "" {
+			phase = "final_answer"
+		}
 		if currentMessageID == "" {
 			rem := msgFilter.flush()
 			if len(rem) == 0 {
@@ -182,6 +231,7 @@ func MapGeminiStreamToResponses(
 					"id":      currentMessageID,
 					"type":    "message",
 					"role":    "assistant",
+					"phase":  phase,
 					"status":  "in_progress",
 					"content": []any{},
 				},
@@ -242,6 +292,7 @@ func MapGeminiStreamToResponses(
 			"id":     currentMessageID,
 			"type":   "message",
 			"role":   "assistant",
+			"phase":  phase,
 			"status": "completed",
 			"content": []any{
 				map[string]any{
@@ -340,6 +391,33 @@ func MapGeminiStreamToResponses(
 				// A. Thinking / Reasoning Part
 				if part.Thought && len(part.Text) > 0 {
 					if currentReasoningID == "" {
+						currentThoughtMsgID = randomID("msg_thought")
+						thoughtMsgIndex = outputIndex
+						outputIndex++
+
+						emitSSE("response.output_item.added", map[string]any{
+							"output_index": thoughtMsgIndex,
+							"item": map[string]any{
+								"id":      currentThoughtMsgID,
+								"type":    "message",
+								"role":    "assistant",
+								"phase":   "commentary",
+								"status":  "in_progress",
+								"content": []any{},
+							},
+						})
+
+						emitSSE("response.content_part.added", map[string]any{
+							"output_index":  thoughtMsgIndex,
+							"item_id":       currentThoughtMsgID,
+							"content_index": 0,
+							"part": map[string]any{
+								"type":        "output_text",
+								"text":        "",
+								"annotations": []any{},
+							},
+						})
+
 						currentReasoningID = randomID("rs")
 						reasoningIndex = outputIndex
 						outputIndex++
@@ -368,7 +446,15 @@ func MapGeminiStreamToResponses(
 
 					accumulatedReasoning.WriteString(part.Text)
 
-					// Stream full multiline thought to reasoning_summary_text.delta (triggers Accordion in Codex Desktop)
+					// Stream full multiline thought to commentary message item (renders live multi-line & persists inside collapsible Worked for Xs)
+					emitSSE("response.output_text.delta", map[string]any{
+						"output_index":  thoughtMsgIndex,
+						"item_id":       currentThoughtMsgID,
+						"content_index": 0,
+						"delta":         part.Text,
+					})
+
+					// Also stream to reasoning_summary_text.delta for reasoning status bar
 					emitSSE("response.reasoning_summary_text.delta", map[string]any{
 						"output_index":  reasoningIndex,
 						"item_id":       currentReasoningID,
@@ -421,6 +507,7 @@ func MapGeminiStreamToResponses(
 								"id":      currentMessageID,
 								"type":    "message",
 								"role":    "assistant",
+								"phase":   "final_answer",
 								"status":  "in_progress",
 								"content": []any{},
 							},
@@ -456,7 +543,7 @@ func MapGeminiStreamToResponses(
 				// C. Function / Tool Call Part
 				if part.FunctionCall != nil {
 					closeReasoning()
-					closeMessage()
+					closeMessage("commentary")
 
 					callID := randomID("call")
 					fcIndex := outputIndex
@@ -771,6 +858,7 @@ func MapGeminiStreamToResponses(
 									"id":      msgID,
 									"type":    "message",
 									"role":    "assistant",
+									"phase":   "final_answer",
 									"status":  "in_progress",
 									"content": []any{},
 								},
@@ -816,6 +904,7 @@ func MapGeminiStreamToResponses(
 								"id":     msgID,
 								"type":   "message",
 								"role":   "assistant",
+								"phase":  "final_answer",
 								"status": "completed",
 								"content": []any{
 									map[string]any{
@@ -940,7 +1029,7 @@ func MapGeminiStreamToResponses(
 
 	// Close open items
 	closeReasoning()
-	closeMessage()
+	closeMessage("final_answer")
 
 	// If no message item was emitted yet (e.g. from an autonomous loop that ended without explicit text),
 	// synthesize an assistant message containing all generated images.
@@ -971,6 +1060,7 @@ func MapGeminiStreamToResponses(
 				"id":      msgID,
 				"type":    "message",
 				"role":    "assistant",
+				"phase":   "final_answer",
 				"status":  "in_progress",
 				"content": []any{},
 			},
@@ -1016,6 +1106,7 @@ func MapGeminiStreamToResponses(
 			"id":     msgID,
 			"type":   "message",
 			"role":   "assistant",
+			"phase":  "final_answer",
 			"status": "completed",
 			"content": []any{
 				map[string]any{
@@ -1042,12 +1133,13 @@ func MapGeminiStreamToResponses(
 		outputTokens = 1
 	}
 
-	// Safety net: if no actionable items (no message, no tool call) were emitted,
+	// Safety net: if no actionable items (no final_answer message, no tool call) were emitted,
 	// synthesize an assistant message so Codex never halts with an empty turn
 	hasActionableItem := false
 	for _, it := range completedOutputItems {
 		t, _ := it["type"].(string)
-		if t == "message" || t == "function_call" || t == "custom_tool_call" || t == "image_generation_call" || t == "tool_search_call" {
+		ph, _ := it["phase"].(string)
+		if (t == "message" && ph != "commentary") || t == "function_call" || t == "custom_tool_call" || t == "image_generation_call" || t == "tool_search_call" {
 			hasActionableItem = true
 			break
 		}
@@ -1076,6 +1168,7 @@ func MapGeminiStreamToResponses(
 				"id":      msgID,
 				"type":    "message",
 				"role":    "assistant",
+				"phase":   "final_answer",
 				"status":  "in_progress",
 				"content": []any{},
 			},
@@ -1116,6 +1209,7 @@ func MapGeminiStreamToResponses(
 			"id":     msgID,
 			"type":   "message",
 			"role":   "assistant",
+			"phase":  "final_answer",
 			"status": "completed",
 			"content": []any{
 				map[string]any{

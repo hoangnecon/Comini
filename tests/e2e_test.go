@@ -115,6 +115,12 @@ func TestE2EResponsesImageAndToolLoop(t *testing.T) {
 	if !strings.Contains(body, "event: response.output_text.delta") {
 		t.Fatalf("missing output text delta")
 	}
+	if !strings.Contains(body, `"phase":"commentary"`) {
+		t.Fatalf("missing commentary phase on thought message item")
+	}
+	if !strings.Contains(body, `"phase":"final_answer"`) {
+		t.Fatalf("missing final_answer phase on assistant message item")
+	}
 	if !strings.Contains(body, "The image has contrast issue.") {
 		t.Fatalf("missing answer text")
 	}
@@ -127,7 +133,7 @@ func TestResolveModelAndEffortLadder(t *testing.T) {
 		expectedWire  string
 		expectedLevel string
 	}{
-		// 3.8 Flash (wire suffix encodes effort)
+		// 3.8 Flash (wire suffix encodes effort, thinkingBudget is used instead of thinkingLevel)
 		{"gemini-3.8-flash", "low", "gemini-3.8-flash-low", ""},
 		{"gemini-3.8-flash", "medium", "gemini-3.8-flash-medium", ""},
 		{"gemini-3.8-flash", "high", "gemini-3.8-flash-high", ""},
@@ -146,20 +152,20 @@ func TestResolveModelAndEffortLadder(t *testing.T) {
 		{"gemini-3.1-pro", "medium", "gemini-pro-agent", "medium"},
 		{"gemini-3.1-pro", "high", "gemini-pro-agent", "high"},
 
-		// Claude models (4.6 legacy + 5.5 active)
-		{"claude-sonnet-4-6", "low", "claude-sonnet-4-6", "low"},
-		{"claude-sonnet-4-6", "high", "claude-sonnet-4-6", "high"},
-		{"claude-opus-4-6-thinking", "high", "claude-opus-4-6-thinking", "high"},
-		{"google-antigravity/claude-sonnet-5-5", "low", "claude-sonnet-5-5-low", ""},
-		{"google-antigravity/claude-sonnet-5-5", "medium", "claude-sonnet-5-5-medium", ""},
-		{"google-antigravity/claude-sonnet-5-5", "high", "claude-sonnet-5-5-high", ""},
-		{"google-antigravity/claude-opus-5-5-thinking", "low", "claude-opus-5-5-low", ""},
-		{"google-antigravity/claude-opus-5-5-thinking", "high", "claude-opus-5-5-high", ""},
+		// Claude models (4.6 legacy + 5.5 active matching Antigravity 2.0 Hub)
+		{"claude-sonnet-4-6", "low", "claude-sonnet-4-6", ""},
+		{"claude-sonnet-4-6", "high", "claude-sonnet-4-6", ""},
+		{"claude-opus-4-6-thinking", "high", "claude-opus-4-6-thinking", ""},
+		{"google-antigravity/claude-sonnet-5-5", "low", "claude-sonnet-5-5-low", "LOW"},
+		{"google-antigravity/claude-sonnet-5-5", "medium", "claude-sonnet-5-5-medium", "MEDIUM"},
+		{"google-antigravity/claude-sonnet-5-5", "high", "claude-sonnet-5-5-high", "HIGH"},
+		{"google-antigravity/claude-opus-5-5-thinking", "low", "claude-opus-5-5-low", "LOW"},
+		{"google-antigravity/claude-opus-5-5-thinking", "high", "claude-opus-5-5-high", "HIGH"},
 
-		// Gemini 4 Argon (1:1 3-rung ladder matching Antigravity)
-		{"google-antigravity/gemini-4-argon", "low", "gemini-4-argon-low", ""},
-		{"google-antigravity/gemini-4-argon", "medium", "gemini-4-argon-medium", ""},
-		{"google-antigravity/gemini-4-argon", "high", "gemini-4-argon-high", ""},
+		// Gemini 4 Argon (1:1 3-rung ladder matching Antigravity 2.0 Hub)
+		{"google-antigravity/gemini-4-argon", "low", "gemini-4-argon-low", "LOW"},
+		{"google-antigravity/gemini-4-argon", "medium", "gemini-4-argon-medium", "MEDIUM"},
+		{"google-antigravity/gemini-4-argon", "high", "gemini-4-argon-high", "HIGH"},
 	}
 
 	for _, tc := range cases {

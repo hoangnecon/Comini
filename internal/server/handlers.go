@@ -449,6 +449,24 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		resolved.ThinkingLevel,
 		h.store,
 	)
+	if wireBody.GenerationConfig == nil {
+		wireBody.GenerationConfig = &domain.GeminiGenerationConfig{}
+	}
+	if wireBody.GenerationConfig.ThinkingConfig == nil {
+		if resolved.ThinkingLevel != "" || resolved.ThinkingBudget != nil {
+			wireBody.GenerationConfig.ThinkingConfig = &domain.GeminiThinkingConfig{
+				IncludeThoughts: true,
+				ThinkingLevel:   resolved.ThinkingLevel,
+				ThinkingBudget:  resolved.ThinkingBudget,
+			}
+		}
+	} else if resolved.ThinkingBudget != nil && wireBody.GenerationConfig.ThinkingConfig.ThinkingLevel == "" {
+		wireBody.GenerationConfig.ThinkingConfig.ThinkingBudget = resolved.ThinkingBudget
+	}
+	if wireBody.GenerationConfig.MaxOutputTokens == nil && resolved.MaxOutputTokens > 0 {
+		maxOut := resolved.MaxOutputTokens
+		wireBody.GenerationConfig.MaxOutputTokens = &maxOut
+	}
 
 	// 6. Authentication resolution (Auto AuthManager -> Static Token -> Header)
 	var authHeader string

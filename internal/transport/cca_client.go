@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,9 +19,10 @@ import (
 	"comini/internal/domain"
 )
 
+const agyHubUserAgent = "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; auth_method=google_oauth)"
+
 var defaultCandidateBaseURLs = []string{
 	"https://daily-cloudcode-pa.googleapis.com",
-	"https://cloudcode-pa.googleapis.com",
 }
 
 type CCAClient struct {
@@ -50,34 +50,15 @@ func NewCCAClient(baseURL, userAgent string) *CCAClient {
 		addURL(fallback)
 	}
 
-	// Resilient dialer with fallback to Google Public DNS (8.8.8.8:53) if system DNS fails
-	dialer := &net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 3 * time.Second}
-				conn, err := d.DialContext(ctx, network, address)
-				if err != nil {
-					return d.DialContext(ctx, "udp", "8.8.8.8:53")
-				}
-				return conn, nil
-			},
-		},
-	}
-
+	// Exact match of Antigravity 2.0 Hub CreateCloudCodeHTTPClient (0x1019974b0):
+	// Non-nil TLSClientConfig without ForceAttemptHTTP2 forces HTTP/1.1 (h1) with native system DNS and no header timeout.
 	return &CCAClient{
 		baseURLs:  urls,
 		userAgent: userAgent,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				DialContext:           dialer.DialContext,
-				ResponseHeaderTimeout: 90 * time.Second,
-				IdleConnTimeout:       90 * time.Second,
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   10,
-				ForceAttemptHTTP2:     true,
+				Proxy:           http.ProxyFromEnvironment,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 			},
 			Timeout: 0,
 		},
@@ -87,10 +68,13 @@ func NewCCAClient(baseURL, userAgent string) *CCAClient {
 func genRequestID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	return fmt.Sprintf("agent-%s", hex.EncodeToString(b))
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("agent/%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// StreamGenerateContent sends CCA envelope request and returns response stream with automatic multi-endpoint fallback and 429 rate-limit backoff.
+// StreamGenerateContent sends CCA envelope request and returns response stream with automatic retry and 429 rate-limit backoff.
 func (c *CCAClient) StreamGenerateContent(
 	ctx context.Context,
 	wireModelID string,
@@ -101,6 +85,9 @@ func (c *CCAClient) StreamGenerateContent(
 	if projectID == "" {
 		projectID = "aicode-consumers"
 	}
+
+	// Exact match of Antigravity 2.0 Hub StreamGenerateContent (0x101993228): clear SessionID before marshaling CCAEnvelope.
+	body.SessionID = ""
 
 	envelope := domain.CCAEnvelope{
 		Model:       wireModelID,
@@ -135,7 +122,7 @@ func (c *CCAClient) StreamGenerateContent(
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", agyHubUserAgent)
 		if authHeader != "" {
 			ah := authHeader
 			if !strings.HasPrefix(ah, "Bearer ") {
@@ -265,7 +252,7 @@ func (c *CCAClient) GenerateImage(
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", agyHubUserAgent)
 		if authHeader != "" {
 			ah := authHeader
 			if !strings.HasPrefix(ah, "Bearer ") {
@@ -361,7 +348,7 @@ func (c *CCAClient) GenerateImage(
 		if strings.Contains(mimeType, "png") {
 			ext = ".png"
 		}
-		fileName := fmt.Sprintf("img_%d_%s%s", time.Now().Unix(), genRequestID()[:8], ext)
+		fileName := fmt.Sprintf("img_%d_%s%s", time.Now().Unix(), strings.TrimPrefix(genRequestID(), "agent/")[:8], ext)
 		savedPath := filepath.Join(imagesDir, fileName)
 
 		if err := os.WriteFile(savedPath, imgBytes, 0644); err != nil {
@@ -408,7 +395,7 @@ func (c *CCAClient) FetchQuotaAndModels(ctx context.Context, authHeader string, 
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", agyHubUserAgent)
 		if authHeader != "" {
 			ah := authHeader
 			if !strings.HasPrefix(ah, "Bearer ") {
@@ -514,7 +501,7 @@ func (c *CCAClient) FetchUserQuotaSummary(ctx context.Context, authHeader string
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64)")
+		req.Header.Set("User-Agent", agyHubUserAgent)
 		if authHeader != "" {
 			ah := authHeader
 			if !strings.HasPrefix(ah, "Bearer ") {

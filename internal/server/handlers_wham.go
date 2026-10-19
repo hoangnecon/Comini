@@ -105,6 +105,16 @@ func (h *Handlers) HandleWhamUsage(w http.ResponseWriter, r *http.Request) {
 
 // HandleWhamAccountsCheck serves /wham/accounts/check and /backend-api/wham/accounts/check for Codex Desktop.
 func (h *Handlers) HandleWhamAccountsCheck(w http.ResponseWriter, r *http.Request) {
+	// Electron main process (tue.readAccounts via Qle.fetchAuthenticatedJson) sends OAI-Language
+	// and validates workspace_backend_origin against Zod enum ["NO_CONSTRAINT", "https://gov.chatgpt.com"].
+	// Rust codex app-server (during account/read workspace routing discovery) sends no OAI-Language
+	// and requires workspace_backend_origin to be a valid https:// origin.
+	ua := r.Header.Get("User-Agent")
+	backendOrigin := "https://chatgpt.com"
+	if r.Header.Get("OAI-Language") != "" || strings.Contains(ua, "Electron") || strings.Contains(ua, "Mozilla") {
+		backendOrigin = "NO_CONSTRAINT"
+	}
+
 	payload := map[string]any{
 		"accounts": []map[string]any{
 			{
@@ -119,7 +129,7 @@ func (h *Handlers) HandleWhamAccountsCheck(w http.ResponseWriter, r *http.Reques
 				"is_openai_internal":       false,
 				"can_access_with_session":  true,
 				"is_deactivated":           false,
-				"workspace_backend_origin": "https://chatgpt.com",
+				"workspace_backend_origin": backendOrigin,
 				"account_routing_override": "NO_CONSTRAINT",
 			},
 		},
@@ -727,13 +737,37 @@ func (h *Handlers) HandleProfiles(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"user_id":            CodexUserID,
-		"account_id":         CodexAccountID,
-		"email":              email,
-		"display_name":       email,
-		"username":           "comini",
-		"profile_visibility": "private",
-		"is_self":            true,
+		"user_id":             CodexUserID,
+		"account_id":          CodexAccountID,
+		"email":               email,
+		"display_name":        email,
+		"username":            "comini",
+		"profile_visibility":  "private",
+		"is_self":             true,
+		"current_streak_days": 1,
+		"profile": map[string]any{
+			"display_name":        email,
+			"username":            "comini",
+			"profile_picture_url": nil,
+		},
+		"stats": map[string]any{
+			"daily_usage_buckets":                  []any{},
+			"current_streak_days":                  1,
+			"longest_streak_days":                  1,
+			"longest_running_turn_sec":             0,
+			"peak_daily_tokens":                    0,
+			"lifetime_tokens":                      0,
+			"fast_mode_usage_percentage":           0,
+			"top_invocations":                      []any{},
+			"most_used_reasoning_effort":           "high",
+			"most_used_reasoning_effort_percentage": 100,
+			"unique_skills_used":                   0,
+			"total_skills_used":                    0,
+			"total_threads":                        0,
+		},
+		"metadata": map[string]any{
+			"stats_error": nil,
+		},
 		"profile_details": map[string]any{
 			"display_name":        email,
 			"username":            "comini",

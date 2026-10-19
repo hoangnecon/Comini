@@ -75,6 +75,7 @@ type InputItem struct {
 	Failure          string           `json:"failure,omitempty"`
 	AspectRatio      string           `json:"aspect_ratio,omitempty"`
 	Effort           string           `json:"effort,omitempty"`
+	Phase            string           `json:"phase,omitempty"`
 }
 
 func (i *InputItem) UnmarshalJSON(data []byte) error {

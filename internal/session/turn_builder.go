@@ -99,6 +99,40 @@ func detectMimeType(b64 string) string {
 	return "image/png"
 }
 
+func normalizeValidBase64Image(mime, rawB64 string) (*domain.GeminiInlineData, bool) {
+	var b strings.Builder
+	b.Grow(len(rawB64))
+	for i := 0; i < len(rawB64); i++ {
+		c := rawB64[i]
+		if c == '\r' || c == '\n' || c == ' ' || c == '\t' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	clean := b.String()
+	if len(clean) < 16 || len(clean)%4 != 0 {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(clean)
+	if err != nil || len(decoded) < 4 {
+		return nil, false
+	}
+	// If it starts with JPEG magic prefix (/9j/), verify it is a complete, non-truncated JPEG
+	if strings.HasPrefix(clean, "/9j/") {
+		if _, err := jpeg.Decode(bytes.NewReader(decoded)); err != nil {
+			return nil, false
+		}
+	}
+	canonical := base64.StdEncoding.EncodeToString(decoded)
+	if mime == "" {
+		mime = detectMimeType(canonical)
+	}
+	return &domain.GeminiInlineData{
+		MimeType: mime,
+		Data:     canonical,
+	}, true
+}
+
 func extractDataURL(s string) (string, string, bool) {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "data:image/") {
@@ -110,7 +144,10 @@ func extractDataURL(s string) (string, string, bool) {
 	}
 	mime := s[5:idx]
 	data := strings.TrimSpace(s[idx+8:])
-	return mime, data, true
+	if inData, ok := normalizeValidBase64Image(mime, data); ok {
+		return inData.MimeType, inData.Data, true
+	}
+	return "", "", false
 }
 
 func tryLoadLocalImage(path string) (*domain.GeminiInlineData, bool) {
@@ -177,11 +214,12 @@ func extractInlineDataFromText(txt string) ([]*domain.GeminiInlineData, string) 
 
 		rawB64 := strings.ReplaceAll(strings.ReplaceAll(cleaned[dataStart:end], "\r", ""), "\n", "")
 		if len(rawB64) > 20 {
-			images = append(images, &domain.GeminiInlineData{
-				MimeType: mime,
-				Data:     rawB64,
-			})
-			cleaned = cleaned[:idx] + fmt.Sprintf("[Attached Image: %s]", mime) + cleaned[end:]
+			if inData, ok := normalizeValidBase64Image(mime, rawB64); ok {
+				images = append(images, inData)
+				cleaned = cleaned[:idx] + fmt.Sprintf("[Attached Image: %s]", inData.MimeType) + cleaned[end:]
+			} else {
+				cleaned = cleaned[:idx] + "[Corrupted Base64 Image Omitted]" + cleaned[end:]
+			}
 		} else {
 			break
 		}
@@ -200,11 +238,12 @@ func extractInlineDataFromText(txt string) ([]*domain.GeminiInlineData, string) 
 			mime = "image/gif"
 		}
 		if mime != "" {
-			images = append(images, &domain.GeminiInlineData{
-				MimeType: mime,
-				Data:     trimmed,
-			})
-			cleaned = fmt.Sprintf("[Attached Image: %s]", mime)
+			if inData, ok := normalizeValidBase64Image(mime, trimmed); ok {
+				images = append(images, inData)
+				cleaned = fmt.Sprintf("[Attached Image: %s]", inData.MimeType)
+			} else {
+				cleaned = "[Corrupted Base64 Image Omitted]"
+			}
 		}
 	}
 
@@ -242,13 +281,17 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 			}
 			if len(val) > 200 && (strings.HasPrefix(val, "iVBORw0KGgo") || strings.HasPrefix(val, "/9j/") || strings.HasPrefix(val, "UklGR") || strings.HasPrefix(val, "R0lGOD")) {
 				mime := detectMimeType(val)
-				images = append(images, &domain.GeminiInlineData{MimeType: mime, Data: val})
-				cleanMap[k] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", mime)
+				if inData, ok := normalizeValidBase64Image(mime, val); ok {
+					images = append(images, inData)
+					cleanMap[k] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", inData.MimeType)
+				} else {
+					cleanMap[k] = "[Corrupted Base64 Image Omitted]"
+				}
 				continue
 			}
 			if strings.Contains(val, "data:image/") {
 				imgs, cleaned := extractInlineDataFromText(val)
-				if len(imgs) > 0 {
+				if len(imgs) > 0 || cleaned != val {
 					images = append(images, imgs...)
 					cleanMap[k] = cleaned
 					continue
@@ -275,8 +318,12 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 					if mime == "" {
 						mime = detectMimeType(data)
 					}
-					images = append(images, &domain.GeminiInlineData{MimeType: mime, Data: data})
-					cleanMap[k] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", mime)
+					if inData, ok := normalizeValidBase64Image(mime, data); ok {
+						images = append(images, inData)
+						cleanMap[k] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", inData.MimeType)
+					} else {
+						cleanMap[k] = "[Corrupted Base64 Image Omitted]"
+					}
 					continue
 				}
 			}
@@ -301,7 +348,7 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 					}
 				} else if elemStr, ok := elem.(string); ok {
 					subImgs, subClean := extractInlineDataFromText(elemStr)
-					if len(subImgs) > 0 {
+					if len(subImgs) > 0 || subClean != elemStr {
 						images = append(images, subImgs...)
 						cleanList = append(cleanList, subClean)
 					} else {
@@ -327,17 +374,21 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 			mime = detectMimeType(b64)
 		}
 		if strings.HasPrefix(mime, "image/") {
-			alreadyExtracted := false
-			for _, img := range images {
-				if img.Data == b64 {
-					alreadyExtracted = true
-					break
+			if inData, ok := normalizeValidBase64Image(mime, b64); ok {
+				alreadyExtracted := false
+				for _, img := range images {
+					if img.Data == inData.Data {
+						alreadyExtracted = true
+						break
+					}
 				}
+				if !alreadyExtracted {
+					images = append(images, inData)
+				}
+				cleanMap["data"] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", inData.MimeType)
+			} else {
+				cleanMap["data"] = "[Corrupted Base64 Image Omitted]"
 			}
-			if !alreadyExtracted {
-				images = append(images, &domain.GeminiInlineData{MimeType: mime, Data: b64})
-			}
-			cleanMap["data"] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", mime)
 		}
 	}
 
@@ -719,8 +770,13 @@ func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.Gem
 		for pi := len(contents[ci].Parts) - 1; pi >= 0; pi-- {
 			p := &contents[ci].Parts[pi]
 			if p.InlineData != nil && len(p.InlineData.Data) > 0 {
-				// Re-encode oversized raw PNGs to clean JPEGs if needed
-				p.InlineData = compressOversizedImage(p.InlineData)
+				validData, ok := normalizeValidBase64Image(p.InlineData.MimeType, p.InlineData.Data)
+				if !ok {
+					p.Text = "[Corrupted Base64 Image Omitted]"
+					p.InlineData = nil
+					continue
+				}
+				p.InlineData = compressOversizedImage(validData)
 
 				imgLen := len(p.InlineData.Data)
 				if keptImages < maxKeep && accumulatedImageChars+imgLen <= maxTotalImageChars {
@@ -1193,6 +1249,9 @@ func BuildGeminiWireBodyWithItems(
 			}
 
 		case "agentmessage":
+			if strings.HasPrefix(item.ID, "msg_thought_") || strings.EqualFold(item.Phase, "commentary") {
+				continue
+			}
 			if currentRole != "" && currentRole != "model" {
 				flushTurn()
 			}
@@ -1215,6 +1274,9 @@ func BuildGeminiWireBodyWithItems(
 			}
 
 		case "message", "usermessage", "text", "inputtext", "":
+			if strings.HasPrefix(item.ID, "msg_thought_") || (item.Role == "assistant" && strings.EqualFold(item.Phase, "commentary")) {
+				continue
+			}
 			role := "user"
 			if item.Role == "assistant" {
 				role = "model"

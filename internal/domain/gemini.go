@@ -89,8 +89,9 @@ type GeminiToolConfig struct {
 }
 
 type GeminiThinkingConfig struct {
-	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
 	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
 }
 
 type GeminiGenerationConfig struct {
