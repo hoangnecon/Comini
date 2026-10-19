@@ -586,29 +586,20 @@ func mergeConsecutiveRoles(contents []domain.GeminiContent) []domain.GeminiConte
 }
 
 func capAllPartsText(contents []domain.GeminiContent) []domain.GeminiContent {
-	// Standard ChatGPT / Codex context standards aligned with tool_output_token_limit = 10,000 tokens (~40,000–48,000 chars):
+	// Standard ChatGPT / Codex context standards aligned with tool_output_token_limit:
 	// CRITICAL INVARIANT FOR PREFIX CACHING:
-	// Never use a sliding index relative to len(contents) (e.g. `numContents-1-ci <= 4`), because
-	// on every new turn `len(contents)` increments by 2, which would mutate turn `N-5` from 48KB to 6KB
-	// on every single request and destroy Google CCA's prefix cache starting at turn `N-5`!
-	// Instead, we apply:
-	// 1. A deterministic 48,000-char (~12k token) cap on all parts across the active epoch.
-	// 2. Quantized epoch decay (6,000 chars) ONLY on turns strictly before the frozen 16-turn epoch boundary
-	//    (`quantizedBoundary := ((len(contents) - 5) / 16) * 16`), so the prefix stays 100% byte-identical
-	//    for 16 consecutive turns!
-	const activeTurnToolMaxChars = 48000
-	const historicalToolMaxChars = 6000
+	// Never mutate a historical turn's cap based on len(contents) (neither sliding nor epoch boundary),
+	// because mutating a turn after it has already been sent to Google CCA invalidates the KV prefix
+	// cache from that turn onwards!
+	// Instead, apply a single deterministic, position-invariant cap (32,000 chars ≈ 8,000 tokens per
+	// tool output, 48,000 chars for the initial prompt at index 0) the first time a part enters contents.
+	const initialTurnMaxChars = 48000
+	const standardPartMaxChars = 32000
 
-	numContents := len(contents)
-	quantizedBoundary := 0
-	if numContents > 20 {
-		quantizedBoundary = ((numContents - 5) / 16) * 16
-	}
-
-	for ci := numContents - 1; ci >= 0; ci-- {
-		maxToolChars := activeTurnToolMaxChars
-		if ci > 0 && ci < quantizedBoundary {
-			maxToolChars = historicalToolMaxChars
+	for ci := range contents {
+		maxToolChars := standardPartMaxChars
+		if ci == 0 {
+			maxToolChars = initialTurnMaxChars
 		}
 
 		for pi := range contents[ci].Parts {
@@ -760,7 +751,7 @@ func compressOversizedImage(in *domain.GeminiInlineData) *domain.GeminiInlineDat
 func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.GeminiContent {
 	// Strictly enforce a maximum total budget for image payload across the request.
 	// This guarantees images NEVER starve or displace the textual conversation history!
-	const maxTotalImageChars = 1200000 // ~300k tokens max for images
+	const maxTotalImageChars = 1200000 // ~300k base64 chars max for images
 
 	keptImages := 0
 	accumulatedImageChars := 0
@@ -819,88 +810,9 @@ func isUserConversationalContent(c domain.GeminiContent) bool {
 	return false
 }
 
-func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.GeminiContent {
-	contents = capAllPartsText(contents)
-	contents = sanitizeAndValidateGeminiContents(contents)
-
-	calcContentSize := func(c domain.GeminiContent) int {
-		total := 0
-		for _, p := range c.Parts {
-			total += len(p.Text)
-			if p.FunctionCall != nil {
-				b, _ := json.Marshal(p.FunctionCall.Args)
-				total += len(b)
-			}
-			if p.FunctionResponse != nil {
-				b, _ := json.Marshal(p.FunctionResponse.Response)
-				total += len(b)
-			}
-			if p.InlineData != nil {
-				total += len(p.InlineData.Data)
-			}
-		}
-		return total
-	}
-
-	calcTotalSize := func(cts []domain.GeminiContent) int {
-		total := 0
-		for _, c := range cts {
-			total += calcContentSize(c)
-		}
-		return total
-	}
-
-	// Standard ChatGPT / Codex context standards:
-	// Full context ceiling aligned with OpenAI's 200k token / 272k context window (~800,000 characters).
-	// This prevents massive multi-hundred-thousand-token context accumulation per turn,
-	// dramatically conserving Google CCA quota while matching Antigravity's native 256k limit.
-	const maxCharsBudget = 800000
-
-	// Stage 1: Enforce image budget.
-	// Keep at most 2 most recent images that fit under 1.2MB image budget.
-	// Excess or oversized images are compressed and converted to text placeholders.
-	contents = evictStaleImages(contents, 2)
-
-	if calcTotalSize(contents) <= maxCharsBudget {
-		return sanitizeAndValidateGeminiContents(contents)
-	}
-
-	// Stage 2: Quantized Turn Pruning when text/history still exceeds budget.
-	// Scan backwards from the end to keep as many recent turns as fit under budget.
-	targetBudget := maxCharsBudget * 80 / 100 // ~640KB leaves space for system and preserved user turns
-	accumulated := 0
-	rawCutoff := 1
-	for i := len(contents) - 1; i >= 1; i-- {
-		sz := calcContentSize(contents[i])
-		if accumulated+sz > targetBudget {
-			rawCutoff = i + 1
-			break
-		}
-		accumulated += sz
-	}
-
-	// QUANTIZED CUTOFF: Round down cutoff index to a multiple of 16 turns.
-	// This prevents the sliding window trap, keeping the prefix byte stream 100% frozen
-	// across 16 consecutive requests so prefix caching achieves 95%+ hit rate!
-	cutoffIndex := (rawCutoff / 16) * 16
-	if cutoffIndex <= 0 {
-		cutoffIndex = 1
-	}
-	if cutoffIndex >= len(contents)-5 {
-		cutoffIndex = len(contents) - 5
-		if cutoffIndex < 1 {
-			cutoffIndex = 1
-		}
-	}
-
-	first := contents[0]
-	recent := contents[cutoffIndex:]
-
-	// Extract preserved conversational user instructions from pruned history.
-	// Cap each preserved user prompt to 2,000 characters and strip any image data
-	// to ensure ancient large text/file pastes don't inflate the context.
+func extractPreservedUserTurns(contents []domain.GeminiContent, cutoffIndex int) []domain.GeminiContent {
 	var preservedUserTurns []domain.GeminiContent
-	for i := 1; i < cutoffIndex; i++ {
+	for i := 1; i < cutoffIndex && i < len(contents); i++ {
 		if isUserConversationalContent(contents[i]) {
 			item := contents[i]
 			var cleanedParts []domain.GeminiPart
@@ -927,18 +839,132 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent) []domain.Ge
 			}
 		}
 	}
-
-	// If there are too many preserved user turns, keep only the most recent 10 key user instructions.
 	if len(preservedUserTurns) > 10 {
 		preservedUserTurns = preservedUserTurns[len(preservedUserTurns)-10:]
 	}
+	return preservedUserTurns
+}
 
-	newContents := []domain.GeminiContent{first}
+func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID string, store *SignatureStore) []domain.GeminiContent {
+	contents = capAllPartsText(contents)
+	contents = sanitizeAndValidateGeminiContents(contents)
+
+	// Measure textual/structural token weight independently of raw base64 image bytes.
+	// Gemini Vision bills images at fixed tile tokens (~258-1032 tokens ≈ 4,000 chars),
+	// whereas counting raw base64 length (~250,000 chars) caused cutoffIndex to jump
+	// forward/backward by 40-80 turns whenever an image was added or evicted!
+	calcContentSize := func(c domain.GeminiContent) int {
+		total := 0
+		for _, p := range c.Parts {
+			total += len(p.Text)
+			if p.FunctionCall != nil {
+				b, _ := json.Marshal(p.FunctionCall.Args)
+				total += len(b)
+			}
+			if p.FunctionResponse != nil {
+				b, _ := json.Marshal(p.FunctionResponse.Response)
+				total += len(b)
+			}
+			if p.InlineData != nil {
+				total += 4000
+			}
+		}
+		return total
+	}
+
+	calcTotalSize := func(cts []domain.GeminiContent) int {
+		total := 0
+		for _, c := range cts {
+			total += calcContentSize(c)
+		}
+		return total
+	}
+
+	// Context ceiling safety net set to 3,800,000 textual chars (~950,000 - 1,000,000 tokens).
+	// Normal sessions auto-compact natively in Codex at auto_compact_token_limit = 1,000,000 tokens,
+	// keeping 100% of the prefix immutable across the full 1M context window.
+	const maxCharsBudget = 3800000
+
+	// Stage 1: Enforce image budget.
+	// Keep at most 2 most recent images that fit under 1.2MB image budget.
+	contents = evictStaleImages(contents, 2)
+
+	// Check if this session already has a ratcheted cutoffIndex from an earlier compaction.
+	lastCutoff := 0
+	hasCutoff := false
+	if store != nil && sessionID != "" {
+		if c, ok := store.GetSessionCutoff(sessionID); ok && c > 0 {
+			if c < len(contents)-5 {
+				lastCutoff = c
+				hasCutoff = true
+			} else {
+				// History shrank (e.g. Codex ran native checkpoint compaction); clear old cutoff.
+				store.SetSessionCutoff(sessionID, 0)
+			}
+		}
+	}
+
+	// Fast path 1: If session already compacted at lastCutoff, keep cutoffIndex 100% locked
+	// at lastCutoff as long as the active window fits within maxCharsBudget (800,000 chars)!
+	if hasCutoff {
+		first := contents[0]
+		preserved := extractPreservedUserTurns(contents, lastCutoff)
+		recent := contents[lastCutoff:]
+		windowSize := calcContentSize(first) + calcTotalSize(preserved) + calcTotalSize(recent)
+		if windowSize <= maxCharsBudget {
+			newContents := make([]domain.GeminiContent, 0, 1+len(preserved)+len(recent))
+			newContents = append(newContents, first)
+			newContents = append(newContents, preserved...)
+			newContents = append(newContents, recent...)
+			return sanitizeAndValidateGeminiContents(newContents)
+		}
+	} else if calcTotalSize(contents) <= maxCharsBudget {
+		// Fast path 2: Session has never exceeded maxCharsBudget yet.
+		return sanitizeAndValidateGeminiContents(contents)
+	}
+
+	// Stage 2: Hysteresis Compaction when window exceeds maxCharsBudget (800,000 chars).
+	// Drop retained tail down to 55% of budget (~440,000 chars ≈ 110,000 tokens),
+	// creating 360,000 chars (~90,000 tokens ≈ 50-80 consecutive turns) of 100% frozen prefix headroom!
+	retainTarget := maxCharsBudget * 55 / 100
+	accumulated := 0
+	rawCutoff := 1
+	for i := len(contents) - 1; i >= 1; i-- {
+		sz := calcContentSize(contents[i])
+		if accumulated+sz > retainTarget {
+			rawCutoff = i + 1
+			break
+		}
+		accumulated += sz
+	}
+
+	cutoffIndex := (rawCutoff / 16) * 16
+	if hasCutoff && cutoffIndex <= lastCutoff {
+		cutoffIndex = lastCutoff + 16
+	}
+	if cutoffIndex <= 0 {
+		cutoffIndex = 1
+	}
+	if cutoffIndex >= len(contents)-5 {
+		cutoffIndex = len(contents) - 5
+		if cutoffIndex < 1 {
+			cutoffIndex = 1
+		}
+	}
+
+	if store != nil && sessionID != "" {
+		store.SetSessionCutoff(sessionID, cutoffIndex)
+	}
+
+	first := contents[0]
+	preservedUserTurns := extractPreservedUserTurns(contents, cutoffIndex)
+	recent := contents[cutoffIndex:]
+
+	newContents := make([]domain.GeminiContent, 0, 1+len(preservedUserTurns)+len(recent))
+	newContents = append(newContents, first)
 	newContents = append(newContents, preservedUserTurns...)
 	newContents = append(newContents, recent...)
 
-	// Note: We DO NOT drop recent working turns in a loop. With image budget strictly capped at 1.2MB,
-	// recent working memory stays 100% intact and the model NEVER loses its current train of thought.
 	return sanitizeAndValidateGeminiContents(newContents)
 }
 
@@ -1051,6 +1077,9 @@ func BuildGeminiWireBodyWithItems(
 			}
 			if name == "" && norm == "imagegenerationcall" {
 				name = "image_generation"
+			}
+			if name == "" && norm == "toolsearchcall" {
+				name = "tool_search"
 			}
 			args := it.Arguments
 			if args == "" {
@@ -1404,6 +1433,9 @@ func BuildGeminiWireBodyWithItems(
 			if funcName == "" && normType == "localshellcall" {
 				funcName = "exec_command"
 			}
+			if funcName == "" && normType == "toolsearchcall" {
+				funcName = "tool_search"
+			}
 			if funcName == "" && callID != "" {
 				if info, ok := callInfoMap[callID]; ok && info.Name != "" {
 					funcName = info.Name
@@ -1524,6 +1556,9 @@ func BuildGeminiWireBodyWithItems(
 					funcName = fmt.Sprintf("mcp__%s__%s", item.Namespace, funcName)
 				}
 			}
+			if funcName == "" && normType == "toolsearchoutput" {
+				funcName = "tool_search"
+			}
 			if funcName == "" {
 				funcName = callID
 			}
@@ -1536,6 +1571,18 @@ func BuildGeminiWireBodyWithItems(
 			respMap := cleanResp
 			if respMap == nil {
 				respMap = map[string]any{}
+			}
+			if len(item.Output) == 0 && len(item.Tools) > 0 {
+				var discoveredNames []string
+				for _, t := range item.Tools {
+					if t.Name != "" {
+						discoveredNames = append(discoveredNames, t.Name)
+					}
+				}
+				respMap = map[string]any{
+					"status":           "ok",
+					"discovered_tools": discoveredNames,
+				}
 			}
 
 			// 2. ALWAYS append FunctionResponse matching the model's FunctionCall
@@ -1638,7 +1685,7 @@ func BuildGeminiWireBodyWithItems(
 		}
 	}
 
-	contents = enforceContextBudgetOnContents(contents)
+	contents = enforceContextBudgetOnContents(contents, sessionID, store)
 
 	return domain.GeminiWireBody{
 		Contents:          contents,

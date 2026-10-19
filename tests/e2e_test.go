@@ -112,11 +112,11 @@ func TestE2EResponsesImageAndToolLoop(t *testing.T) {
 	if !strings.Contains(body, "event: response.reasoning_summary_text.delta") {
 		t.Fatalf("missing reasoning summary text delta")
 	}
+	if !strings.Contains(body, `"type":"reasoning"`) {
+		t.Fatalf("missing native reasoning item")
+	}
 	if !strings.Contains(body, "event: response.output_text.delta") {
 		t.Fatalf("missing output text delta")
-	}
-	if !strings.Contains(body, `"phase":"commentary"`) {
-		t.Fatalf("missing commentary phase on thought message item")
 	}
 	if !strings.Contains(body, `"phase":"final_answer"`) {
 		t.Fatalf("missing final_answer phase on assistant message item")

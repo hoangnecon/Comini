@@ -1332,3 +1332,74 @@ func TestFullResolutionPaperImageDoesNotDropRecentContext(t *testing.T) {
 	}
 }
 
+func TestHysteresisCompactionLocksPrefixAcross30Turns(t *testing.T) {
+	store := session.NewSignatureStore(time.Hour)
+	var items []domain.InputItem
+
+	items = append(items, domain.InputItem{
+		Type: "message",
+		Role: "user",
+		Text: "Build full-stack platform with 100% prefix cache stability",
+	})
+
+	// Build 140 turns (~4,200,000 chars total) so the session exceeds the 3,800,000-char budget
+	// and triggers hysteresis compaction down to ~2,090,000 chars.
+	chunk30k := strings.Repeat("K", 30000)
+	for i := 1; i <= 140; i++ {
+		callID := fmt.Sprintf("call_hist_%d", i)
+		store.Set(callID, fmt.Sprintf("sig_hist_%d", i), "exec_command")
+		items = append(items, domain.InputItem{
+			Type:      "function_call",
+			Name:      "exec_command",
+			CallID:    callID,
+			Arguments: fmt.Sprintf(`{"cmd":"step %d"}`, i),
+		})
+		items = append(items, domain.InputItem{
+			Type:   "function_call_output",
+			CallID: callID,
+			Output: json.RawMessage(fmt.Sprintf(`{"stdout":"step_%d_%s"}`, i, chunk30k)),
+		})
+	}
+
+	req := domain.ResponsesRequest{Model: "gemini-4-argon"}
+	sessionID := "sess_hysteresis_lock_test"
+
+	prevBody := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "LOW", store)
+
+	// Now simulate 25 consecutive subsequent turns (each ~8KB), crossing multiple 16-turn boundaries.
+	// Every single turn MUST keep the exact same prefix (0 .. len(prevBody.Contents)-1) 100% byte-identical!
+	chunk8k := strings.Repeat("M", 8000)
+	for step := 101; step <= 125; step++ {
+		callID := fmt.Sprintf("call_hist_%d", step)
+		store.Set(callID, fmt.Sprintf("sig_hist_%d", step), "exec_command")
+		items = append(items, domain.InputItem{
+			Type:      "function_call",
+			Name:      "exec_command",
+			CallID:    callID,
+			Arguments: fmt.Sprintf(`{"cmd":"step %d"}`, step),
+		})
+		items = append(items, domain.InputItem{
+			Type:   "function_call_output",
+			CallID: callID,
+			Output: json.RawMessage(fmt.Sprintf(`{"stdout":"step_%d_%s"}`, step, chunk8k)),
+		})
+
+		nextBody := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "LOW", store)
+		if len(nextBody.Contents) != len(prevBody.Contents)+2 {
+			t.Fatalf("step %d: expected contents length to grow by +2 (from %d to %d), got %d (cutoffIndex shifted!)",
+				step, len(prevBody.Contents), len(prevBody.Contents)+2, len(nextBody.Contents))
+		}
+
+		for idx := 0; idx < len(prevBody.Contents); idx++ {
+			b1, _ := json.Marshal(prevBody.Contents[idx])
+			b2, _ := json.Marshal(nextBody.Contents[idx])
+			if string(b1) != string(b2) {
+				t.Fatalf("step %d: prefix turn %d mutated between consecutive turns!\nPrev: %s\nNext: %s",
+					step, idx, string(b1), string(b2))
+			}
+		}
+		prevBody = nextBody
+	}
+}
+
+

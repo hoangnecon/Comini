@@ -86,9 +86,8 @@ func (c *CCAClient) StreamGenerateContent(
 		projectID = "aicode-consumers"
 	}
 
-	// Exact match of Antigravity 2.0 Hub StreamGenerateContent (0x101993228): clear SessionID before marshaling CCAEnvelope.
-	body.SessionID = ""
-
+	// Exact match of Antigravity 2.0 Hub BuildGenerateContentRequest (0x1019929ac -> #0xc0) &
+	// StreamGenerateContent (0x101993228 clears ServiceAccount #0xb0, preserving SessionId #0xc0).
 	envelope := domain.CCAEnvelope{
 		Model:       wireModelID,
 		UserAgent:   "antigravity",

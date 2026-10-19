@@ -167,7 +167,7 @@ func (h *Handlers) HandleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	makeEntry := func(id string) domain.ModelCatalogEntry {
-		ctxWin := 272000
+		ctxWin := 1048576
 		if strings.Contains(id, "claude") {
 			ctxWin = 250000
 		} else if strings.Contains(id, "gpt-oss") {
@@ -296,65 +296,51 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var parsedInputItems []domain.InputItem
+	if len(req.Input) > 0 {
+		_ = json.Unmarshal(req.Input, &parsedInputItems)
+	}
+
 	// 1. Collect all tools from top-level req.Tools and dynamic tool items (additional_tools, tool_search_output).
-	// ONLY collect dynamic tools that belong to the active turn (after the latest user prompt).
-	// Stale dynamic tools from historical turns are not loaded in Codex Desktop's turn router,
-	// so exposing them causes model invocation of unmounted tools resulting in "unsupported call".
+	// Keep discovered dynamic tools across all turns in the session so wireBody.Tools and SystemInstruction
+	// do not mutate when the user sends a follow-up message (preserving 100% of the prefix KV cache).
 	allToolDefs := make([]domain.ToolDefinition, 0, len(req.Tools))
 	allToolDefs = append(allToolDefs, req.Tools...)
 
-	if len(req.Input) > 0 {
-		var inputItems []domain.InputItem
-		if err := json.Unmarshal(req.Input, &inputItems); err == nil {
-			lastUserIdx := -1
-			for i, item := range inputItems {
-				norm := strings.ToLower(strings.TrimSpace(item.Type))
-				role := strings.ToLower(strings.TrimSpace(item.Role))
-				if (norm == "message" || norm == "usermessage" || norm == "userinput") && (role == "user" || role == "") {
-					lastUserIdx = i
-				}
+	for _, item := range parsedInputItems {
+		norm := strings.ToLower(strings.TrimSpace(item.Type))
+		norm = strings.ReplaceAll(norm, "_", "")
+		norm = strings.ReplaceAll(norm, "-", "")
+
+		if norm == "additionaltools" || norm == "toolsearchoutput" || norm == "toolsearch" {
+			if len(item.Tools) > 0 {
+				allToolDefs = append(allToolDefs, item.Tools...)
 			}
-
-			for i, item := range inputItems {
-				if i <= lastUserIdx {
-					continue
-				}
-
-				norm := strings.ToLower(strings.TrimSpace(item.Type))
-				norm = strings.ReplaceAll(norm, "_", "")
-				norm = strings.ReplaceAll(norm, "-", "")
-
-				if norm == "additionaltools" || norm == "toolsearchoutput" || norm == "toolsearch" {
-					if len(item.Tools) > 0 {
-						allToolDefs = append(allToolDefs, item.Tools...)
+			// Also check if tools are inside item.Output or item.Payload
+			if len(item.Tools) == 0 {
+				if len(item.Output) > 0 {
+					var toolContainer struct {
+						Tools []domain.ToolDefinition `json:"tools"`
 					}
-					// Also check if tools are inside item.Output or item.Payload
-					if len(item.Tools) == 0 {
-						if len(item.Output) > 0 {
-							var toolContainer struct {
-								Tools []domain.ToolDefinition `json:"tools"`
-							}
-							if err := json.Unmarshal(item.Output, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
-								allToolDefs = append(allToolDefs, toolContainer.Tools...)
-							} else {
-								var toolList []domain.ToolDefinition
-								if err := json.Unmarshal(item.Output, &toolList); err == nil && len(toolList) > 0 {
-									allToolDefs = append(allToolDefs, toolList...)
-								}
-							}
+					if err := json.Unmarshal(item.Output, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+						allToolDefs = append(allToolDefs, toolContainer.Tools...)
+					} else {
+						var toolList []domain.ToolDefinition
+						if err := json.Unmarshal(item.Output, &toolList); err == nil && len(toolList) > 0 {
+							allToolDefs = append(allToolDefs, toolList...)
 						}
-						if len(item.Payload) > 0 {
-							var toolContainer struct {
-								Tools []domain.ToolDefinition `json:"tools"`
-							}
-							if err := json.Unmarshal(item.Payload, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
-								allToolDefs = append(allToolDefs, toolContainer.Tools...)
-							} else {
-								var toolList []domain.ToolDefinition
-								if err := json.Unmarshal(item.Payload, &toolList); err == nil && len(toolList) > 0 {
-									allToolDefs = append(allToolDefs, toolList...)
-								}
-							}
+					}
+				}
+				if len(item.Payload) > 0 {
+					var toolContainer struct {
+						Tools []domain.ToolDefinition `json:"tools"`
+					}
+					if err := json.Unmarshal(item.Payload, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+						allToolDefs = append(allToolDefs, toolContainer.Tools...)
+					} else {
+						var toolList []domain.ToolDefinition
+						if err := json.Unmarshal(item.Payload, &toolList); err == nil && len(toolList) > 0 {
+							allToolDefs = append(allToolDefs, toolList...)
 						}
 					}
 				}
@@ -381,11 +367,6 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	funcDecls, toolMetaMap := schema.ExtractAndCompileTools(allToolDefs)
 
 	// 3. Resolve Model and Effort
-	var parsedInputItems []domain.InputItem
-	if len(req.Input) > 0 {
-		_ = json.Unmarshal(req.Input, &parsedInputItems)
-	}
-
 	effort := ""
 	if req.Reasoning != nil {
 		effort = req.Reasoning.Effort
@@ -407,7 +388,19 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Derive Session ID
 	parentThreadID := r.Header.Get("x-codex-parent-thread-id")
-	ownThreadID := r.Header.Get("x-codex-thread-id")
+	ownThreadID := r.Header.Get("session_id")
+	if ownThreadID == "" {
+		ownThreadID = r.Header.Get("x-session-id")
+	}
+	if ownThreadID == "" {
+		ownThreadID = r.Header.Get("conversation_id")
+	}
+	if ownThreadID == "" {
+		ownThreadID = r.Header.Get("x-codex-window-id")
+	}
+	if ownThreadID == "" {
+		ownThreadID = r.Header.Get("x-codex-thread-id")
+	}
 	if ownThreadID == "" {
 		ownThreadID = r.Header.Get("x-codex-own-thread-id")
 	}

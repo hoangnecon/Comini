@@ -17,16 +17,18 @@ type callEntry struct {
 }
 
 type persistedStoreData struct {
-	Calls         map[string]callEntry `json:"calls"`
-	BySessionCall map[string]string    `json:"by_session_call"`
+	Calls          map[string]callEntry `json:"calls"`
+	BySessionCall  map[string]string    `json:"by_session_call"`
+	SessionCutoffs map[string]int       `json:"session_cutoffs,omitempty"`
 }
 
 type SignatureStore struct {
-	mu            sync.RWMutex
-	calls         map[string]callEntry
-	bySessionCall map[string]string
-	filePath      string
-	ttl           time.Duration
+	mu             sync.RWMutex
+	calls          map[string]callEntry
+	bySessionCall  map[string]string
+	sessionCutoffs map[string]int
+	filePath       string
+	ttl            time.Duration
 }
 
 var DefaultSignatureStore = NewSignatureStore(30 * 24 * time.Hour)
@@ -44,10 +46,11 @@ func resolveStoreFilePath() string {
 func NewSignatureStore(ttl time.Duration) *SignatureStore {
 	filePath := resolveStoreFilePath()
 	s := &SignatureStore{
-		calls:         make(map[string]callEntry),
-		bySessionCall: make(map[string]string),
-		filePath:      filePath,
-		ttl:           ttl,
+		calls:          make(map[string]callEntry),
+		bySessionCall:  make(map[string]string),
+		sessionCutoffs: make(map[string]int),
+		filePath:       filePath,
+		ttl:            ttl,
 	}
 	s.load()
 	return s
@@ -81,6 +84,9 @@ func (s *SignatureStore) pruneExpiredLocked() {
 	if len(s.bySessionCall) > 10000 {
 		s.bySessionCall = make(map[string]string)
 	}
+	if len(s.sessionCutoffs) > 2000 {
+		s.sessionCutoffs = make(map[string]int)
+	}
 }
 
 func (s *SignatureStore) load() {
@@ -101,6 +107,9 @@ func (s *SignatureStore) load() {
 		if p.BySessionCall != nil {
 			s.bySessionCall = p.BySessionCall
 		}
+		if p.SessionCutoffs != nil {
+			s.sessionCutoffs = p.SessionCutoffs
+		}
 		s.pruneExpiredLocked()
 	}
 }
@@ -111,8 +120,9 @@ func (s *SignatureStore) saveLocked() {
 	}
 	s.pruneExpiredLocked()
 	p := persistedStoreData{
-		Calls:         s.calls,
-		BySessionCall: s.bySessionCall,
+		Calls:          s.calls,
+		BySessionCall:  s.bySessionCall,
+		SessionCutoffs: s.sessionCutoffs,
 	}
 	data, err := json.Marshal(p)
 	if err == nil {
@@ -240,10 +250,38 @@ func (s *SignatureStore) FindAnyCall(funcName string, args any) (string, bool) {
 	return s.bySessionCall[candidates[0]], true
 }
 
+func (s *SignatureStore) GetSessionCutoff(sessionID string) (int, bool) {
+	if s == nil || sessionID == "" {
+		return 0, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.sessionCutoffs[sessionID]
+	return v, ok && v > 0
+}
+
+func (s *SignatureStore) SetSessionCutoff(sessionID string, cutoff int) {
+	if s == nil || sessionID == "" || cutoff <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionCutoffs == nil {
+		s.sessionCutoffs = make(map[string]int)
+	}
+	if prev, ok := s.sessionCutoffs[sessionID]; ok && prev == cutoff {
+		return
+	}
+	s.sessionCutoffs[sessionID] = cutoff
+	s.saveLocked()
+}
+
 func (s *SignatureStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = make(map[string]callEntry)
 	s.bySessionCall = make(map[string]string)
+	s.sessionCutoffs = make(map[string]int)
 	s.saveLocked()
 }
+
