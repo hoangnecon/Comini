@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"comini/internal/domain"
 	"comini/internal/session"
@@ -20,8 +22,61 @@ import (
 
 type StreamOptions struct {
 	Context    context.Context
-	ImageGenFn func(ctx context.Context, prompt string, aspectRatio string) (savedPath string, dataURL string, err error)
+	ImageGenFn func(ctx context.Context, args domain.ImageGenArgs) (savedPath string, dataURL string, err error)
 	ContinueFn func(ctx context.Context, modelPart domain.GeminiPart, observationText string) (io.ReadCloser, error)
+	// CanViewImage reports whether the client declared Codex's native `view_image` tool.
+	// When true, a generated image is handed back to Codex as a regular `view_image`
+	// function_call (rendered natively by the UI) instead of being looped inside one
+	// HTTP response.
+	CanViewImage bool
+	// KeepaliveInterval overrides the idle interval after which an SSE comment frame is sent.
+	// Zero uses defaultKeepaliveInterval.
+	KeepaliveInterval time.Duration
+}
+
+const defaultKeepaliveInterval = 10 * time.Second
+
+// guardedWriter serialises all writes and flushes to the client so that the keepalive
+// goroutine and the mapper never interleave bytes of two SSE frames.
+type guardedWriter struct {
+	mu      sync.Mutex
+	w       io.Writer
+	flusher func()
+	last    time.Time
+}
+
+func (g *guardedWriter) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.last = time.Now()
+	return g.w.Write(p)
+}
+
+func (g *guardedWriter) flush() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.flusher != nil {
+		g.flusher()
+	}
+}
+
+// keepalive writes an SSE comment frame when the stream has been idle for at least `idle`.
+// SSE comments are ignored by the Codex parser but reset its idle timeout and keep
+// intermediaries from closing a quiet connection. It returns false if the write failed.
+func (g *guardedWriter) keepalive(idle time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if time.Since(g.last) < idle {
+		return true
+	}
+	if _, err := io.WriteString(g.w, ": keepalive\n\n"); err != nil {
+		return false
+	}
+	g.last = time.Now()
+	if g.flusher != nil {
+		g.flusher()
+	}
+	return true
 }
 
 func randomID(prefix string) string {
@@ -75,6 +130,7 @@ func MapGeminiStreamToResponses(
 
 	var currentReasoningID string
 	var reasoningIndex int
+	var summaryParts []string
 	var accumulatedReasoning strings.Builder
 
 	var currentMessageID string
@@ -90,15 +146,54 @@ func MapGeminiStreamToResponses(
 		SavedPath string
 	}
 	var allGeneratedImages []generatedImageRecord
+	var allEmittedText strings.Builder
 	hasEmittedMessage := false
 	loopCount := 0
 
 	var inputTokens, outputTokens, reasoningTokens, cachedTokens int
 
-	flushSSE := func() {
-		if flusher != nil {
-			flusher()
+	// Upstream timing diagnostics (logged at the end): lets us measure, from comini.log alone,
+	// whether a "frozen" UI was upstream silence (e.g. a large tool call or hidden reasoning).
+	streamStart := time.Now()
+	lastChunkAt := streamStart
+	var firstChunkGap, maxChunkGap time.Duration
+	chunkCount := 0
+	var lastGap time.Duration
+
+	// All client writes go through gw so the keepalive goroutine below can safely
+	// emit SSE comment frames while this goroutine is blocked on upstream or image I/O.
+	gw := &guardedWriter{w: w, flusher: flusher, last: time.Now()}
+	w = gw
+	keepaliveEvery := streamOpts.KeepaliveInterval
+	if keepaliveEvery <= 0 {
+		keepaliveEvery = defaultKeepaliveInterval
+	}
+	stopKeepalive := make(chan struct{})
+	keepaliveDone := make(chan struct{})
+	// Stop and join the goroutine before returning so no write can race with the caller
+	// reading the destination after this function returns.
+	defer func() {
+		close(stopKeepalive)
+		<-keepaliveDone
+	}()
+	go func() {
+		defer close(keepaliveDone)
+		tick := time.NewTicker(keepaliveEvery / 2)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stopKeepalive:
+				return
+			case <-tick.C:
+				if !gw.keepalive(keepaliveEvery) {
+					return
+				}
+			}
 		}
+	}()
+
+	flushSSE := func() {
+		gw.flush()
 	}
 
 	var writeErr error
@@ -111,90 +206,178 @@ func MapGeminiStreamToResponses(
 		_, writeErr = io.WriteString(w, formatSSEWithSeq(eventType, data, currentSeq))
 	}
 
-	formatThoughtBlockquote := func(raw string) string {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			return raw
+	emitCommentaryMessage := func(thoughtText string) {
+		thoughtText = strings.TrimSpace(thoughtText)
+		if len(thoughtText) < 2 {
+			return
 		}
-		quoteLines := func(s string) string {
-			lines := strings.Split(s, "\n")
-			for i, l := range lines {
-				tl := strings.TrimSpace(l)
-				if strings.HasPrefix(tl, ">") {
-					lines[i] = l
-				} else if tl == "" {
-					lines[i] = ">"
-				} else {
-					lines[i] = "> " + l
-				}
-			}
-			return strings.Join(lines, "\n")
+		comID := randomID("msg")
+		idx := outputIndex
+		outputIndex++
+
+		emitSSE("response.output_item.added", map[string]any{
+			"output_index": idx,
+			"item": map[string]any{
+				"id":      comID,
+				"type":    "message",
+				"role":    "assistant",
+				"phase":   "commentary",
+				"status":  "in_progress",
+				"content": []any{},
+			},
+		})
+
+		emitSSE("response.content_part.added", map[string]any{
+			"output_index":  idx,
+			"item_id":       comID,
+			"content_index": 0,
+			"part": map[string]any{
+				"type":        "output_text",
+				"text":        "",
+				"annotations": []any{},
+			},
+		})
+
+		emitSSE("response.output_text.delta", map[string]any{
+			"output_index":  idx,
+			"item_id":       comID,
+			"content_index": 0,
+			"delta":         thoughtText,
+		})
+
+		emitSSE("response.output_text.done", map[string]any{
+			"output_index":  idx,
+			"item_id":       comID,
+			"content_index": 0,
+			"text":          thoughtText,
+		})
+
+		emitSSE("response.content_part.done", map[string]any{
+			"output_index":  idx,
+			"item_id":       comID,
+			"content_index": 0,
+			"part": map[string]any{
+				"type":        "output_text",
+				"text":        thoughtText,
+				"annotations": []any{},
+			},
+		})
+
+		msgItem := map[string]any{
+			"id":     comID,
+			"type":   "message",
+			"role":   "assistant",
+			"phase":  "commentary",
+			"status": "completed",
+			"content": []any{
+				map[string]any{
+					"type":        "output_text",
+					"text":        thoughtText,
+					"annotations": []any{},
+				},
+			},
 		}
-		if strings.HasPrefix(trimmed, "**") {
-			if nlIdx := strings.IndexByte(trimmed, '\n'); nlIdx != -1 {
-				header := strings.TrimSpace(trimmed[:nlIdx])
-				body := strings.TrimSpace(trimmed[nlIdx+1:])
-				if body != "" {
-					return header + "\n\n" + quoteLines(body)
-				}
-			}
-			return "\u200b> " + trimmed
-		}
-		return "**Thinking**\n\n" + quoteLines(trimmed)
+		completedOutputItems = append(completedOutputItems, msgItem)
+		emitSSE("response.output_item.done", map[string]any{
+			"output_index": idx,
+			"item":         msgItem,
+		})
+		allEmittedText.WriteString(thoughtText)
+		hasEmittedMessage = true
+		flushSSE()
 	}
 
+	// closeReasoning completes the open reasoning item. Summary parts carry ONLY concise bold
+	// headlines (for the 1-line shimmer title span), while raw content parts carry the full thought.
+	// For Codex Desktop, an assistant message with phase: "commentary" is emitted so that the
+	// thought block is permanently and sequentially rendered in the conversation timeline.
 	closeReasoning := func() {
 		if currentReasoningID == "" {
 			return
 		}
-		fullReasoning := formatThoughtBlockquote(accumulatedReasoning.String())
+		rawReasoning := strings.TrimSpace(accumulatedReasoning.String())
+		summary := make([]any, 0, len(summaryParts))
+		for i, partText := range summaryParts {
+			partText = strings.TrimSpace(partText)
+			if partText == "" {
+				continue
+			}
+			summary = append(summary, map[string]any{"type": "summary_text", "text": partText})
+			emitSSE("response.reasoning_summary_text.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": i,
+				"text":          partText,
+			})
+			emitSSE("response.reasoning_summary_part.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": i,
+				"part":          map[string]any{"type": "summary_text", "text": partText},
+			})
+		}
+		if len(summary) == 0 && rawReasoning != "" {
+			headline := extractReasoningHeadline(rawReasoning)
+			titlePart := "**" + headline + "**"
+			summary = append(summary, map[string]any{"type": "summary_text", "text": titlePart})
+			emitSSE("response.reasoning_summary_part.added", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"part":          map[string]any{"type": "summary_text", "text": ""},
+			})
+			emitSSE("response.reasoning_summary_text.delta", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"delta":         titlePart,
+			})
+			emitSSE("response.reasoning_summary_text.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"text":          titlePart,
+			})
+			emitSSE("response.reasoning_summary_part.done", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": 0,
+				"part":          map[string]any{"type": "summary_text", "text": titlePart},
+			})
+		}
 
-		// 1. Done event for reasoning summary text
-		emitSSE("response.reasoning_summary_text.done", map[string]any{
-			"output_index":  reasoningIndex,
-			"item_id":       currentReasoningID,
-			"summary_index": 0,
-			"text":          fullReasoning,
-		})
-
-		// 2. Done event for reasoning summary part
-		emitSSE("response.reasoning_summary_part.done", map[string]any{
-			"output_index":  reasoningIndex,
-			"item_id":       currentReasoningID,
-			"summary_index": 0,
-			"part": map[string]any{
-				"type": "summary_text",
-				"text": fullReasoning,
-			},
-		})
+		reasoningContent := make([]any, 0, 1)
+		if rawReasoning != "" {
+			reasoningContent = append(reasoningContent, map[string]any{
+				"type": "reasoning_text",
+				"text": rawReasoning,
+			})
+		}
 
 		reasoningItem := map[string]any{
-			"id":     currentReasoningID,
-			"type":   "reasoning",
-			"status": "completed",
-			"summary": []any{
-				map[string]any{
-					"type": "summary_text",
-					"text": fullReasoning,
-				},
-			},
-			"content": []any{
-				map[string]any{
-					"type": "reasoning_text",
-					"text": fullReasoning,
-				},
-			},
+			"id":      currentReasoningID,
+			"type":    "reasoning",
+			"status":  "completed",
+			"summary": summary,
+			"content": reasoningContent,
 		}
 		completedOutputItems = append(completedOutputItems, reasoningItem)
-
 		emitSSE("response.output_item.done", map[string]any{
 			"output_index": reasoningIndex,
 			"item":         reasoningItem,
 		})
-		currentReasoningID = ""
 
+		currentReasoningID = ""
+		summaryParts = nil
 		accumulatedReasoning.Reset()
 		flushSSE()
+
+		// Codex Desktop suppresses 'reasoning' items from the chat timeline (`case 'reasoning': return null;`).
+		// Emitting an assistant message with phase: "commentary" renders the thought block permanently
+		// and visibly in the chat timeline, immediately before the upcoming tool call or final response.
+		if rawReasoning != "" && accumulatedMessage.Len() == 0 {
+			emitCommentaryMessage(rawReasoning)
+		}
 	}
 
 	closeMessage := func(phase string) {
@@ -217,7 +400,7 @@ func MapGeminiStreamToResponses(
 					"id":      currentMessageID,
 					"type":    "message",
 					"role":    "assistant",
-					"phase":  phase,
+					"phase":   phase,
 					"status":  "in_progress",
 					"content": []any{},
 				},
@@ -255,6 +438,7 @@ func MapGeminiStreamToResponses(
 			}
 		}
 		fullMsg := accumulatedMessage.String()
+		allEmittedText.WriteString(fullMsg)
 
 		emitSSE("response.output_text.done", map[string]any{
 			"output_index":  messageIndex,
@@ -301,6 +485,115 @@ func MapGeminiStreamToResponses(
 		flushSSE()
 	}
 
+	// streamThought streams one chunk of model reasoning. Raw reasoning is streamed directly
+	// to response.reasoning_text.delta (populating ThreadItem::Reasoning.content). Summary parts
+	// receive ONLY concise bold headlines for Codex Desktop's 1-line shimmer title span,
+	// strictly preventing multi-line markdown overflow on the title bar.
+	streamThought := func(text string) {
+		if currentReasoningID == "" {
+			currentReasoningID = randomID("rs")
+			reasoningIndex = outputIndex
+			outputIndex++
+			accumulatedReasoning.Reset()
+			summaryParts = nil
+			emitSSE("response.output_item.added", map[string]any{
+				"output_index": reasoningIndex,
+				"item": map[string]any{
+					"id":      currentReasoningID,
+					"type":    "reasoning",
+					"status":  "in_progress",
+					"summary": []any{},
+					"content": []any{},
+				},
+			})
+		}
+
+		accumulatedReasoning.WriteString(text)
+
+		// 1. Stream raw thought into reasoning_text
+		emitSSE("response.reasoning_text.delta", map[string]any{
+			"output_index":  reasoningIndex,
+			"item_id":       currentReasoningID,
+			"content_index": 0,
+			"delta":         text,
+		})
+
+		// 2. Manage summary headline (for the 1-line shimmer title bar)
+		startsBlock := strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "**")
+		if len(summaryParts) == 0 {
+			acc := accumulatedReasoning.String()
+			if len(acc) >= 15 || strings.Contains(acc, "\n") || startsBlock {
+				headline := extractReasoningHeadline(acc)
+				titlePart := "**" + headline + "**"
+				summaryParts = append(summaryParts, titlePart)
+				emitSSE("response.reasoning_summary_part.added", map[string]any{
+					"output_index":  reasoningIndex,
+					"item_id":       currentReasoningID,
+					"summary_index": 0,
+					"part":          map[string]any{"type": "summary_text", "text": ""},
+				})
+				emitSSE("response.reasoning_summary_text.delta", map[string]any{
+					"output_index":  reasoningIndex,
+					"item_id":       currentReasoningID,
+					"summary_index": 0,
+					"delta":         titlePart,
+				})
+			}
+		} else if startsBlock && strings.TrimSpace(summaryParts[len(summaryParts)-1]) != "" {
+			idx := len(summaryParts)
+			headline := extractReasoningHeadline(text)
+			titlePart := "**" + headline + "**"
+			summaryParts = append(summaryParts, titlePart)
+			emitSSE("response.reasoning_summary_part.added", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": idx,
+				"part":          map[string]any{"type": "summary_text", "text": ""},
+			})
+			emitSSE("response.reasoning_summary_text.delta", map[string]any{
+				"output_index":  reasoningIndex,
+				"item_id":       currentReasoningID,
+				"summary_index": idx,
+				"delta":         titlePart,
+			})
+		}
+		flushSSE()
+	}
+
+	viewedImages := map[string]bool{}
+
+	// emitFunctionCall emits a complete client-side function_call output item (no Gemini
+	// signature: the call was synthesised by the proxy, not produced by the model).
+	emitFunctionCall := func(name, argsStr string) {
+		callID := randomID("call")
+		fcItemID := randomID("fc")
+		idx := outputIndex
+		outputIndex++
+		fcItem := map[string]any{
+			"id":        fcItemID,
+			"call_id":   callID,
+			"type":      "function_call",
+			"name":      name,
+			"arguments": argsStr,
+			"status":    "completed",
+		}
+		completedOutputItems = append(completedOutputItems, fcItem)
+		emitSSE("response.output_item.added", map[string]any{
+			"output_index": idx,
+			"item": map[string]any{
+				"id": fcItemID, "call_id": callID, "type": "function_call",
+				"name": name, "arguments": "", "status": "in_progress",
+			},
+		})
+		emitSSE("response.function_call_arguments.delta", map[string]any{
+			"output_index": idx, "item_id": fcItemID, "call_id": callID, "delta": argsStr,
+		})
+		emitSSE("response.function_call_arguments.done", map[string]any{
+			"output_index": idx, "item_id": fcItemID, "call_id": callID, "name": name, "arguments": argsStr,
+		})
+		emitSSE("response.output_item.done", map[string]any{"output_index": idx, "item": fcItem})
+	}
+
 	// 1. Emit initial response.created
 	emitSSE("response.created", map[string]any{
 		"response": map[string]any{
@@ -315,6 +608,7 @@ func MapGeminiStreamToResponses(
 	})
 	flushSSE()
 
+scanLoop:
 	for scanner.Scan() {
 		if writeErr != nil {
 			break
@@ -333,6 +627,19 @@ func MapGeminiStreamToResponses(
 		if err := json.Unmarshal([]byte(payloadStr), &root); err != nil {
 			continue
 		}
+
+		lastGap = time.Since(lastChunkAt)
+		lastChunkAt = time.Now()
+		if chunkCount == 0 {
+			firstChunkGap = lastGap
+			if root.Response != nil && root.Response.ModelVersion != "" {
+				log.Printf("[Comini Stream] 🔎 upstream served modelVersion=%s (requested=%s)", root.Response.ModelVersion, modelName)
+			}
+		}
+		if lastGap > maxChunkGap {
+			maxChunkGap = lastGap
+		}
+		chunkCount++
 
 		// Extract candidates and usage
 		var candidates []domain.GeminiCandidate
@@ -375,51 +682,9 @@ func MapGeminiStreamToResponses(
 				}
 
 				// A. Thinking / Reasoning Part
+				// A. Thinking / Reasoning Part
 				if part.Thought && len(part.Text) > 0 {
-					if currentReasoningID == "" {
-						currentReasoningID = randomID("rs")
-						reasoningIndex = outputIndex
-						outputIndex++
-						accumulatedReasoning.Reset()
-
-						emitSSE("response.output_item.added", map[string]any{
-							"output_index": reasoningIndex,
-							"item": map[string]any{
-								"id":      currentReasoningID,
-								"type":    "reasoning",
-								"status":  "in_progress",
-								"summary": []any{},
-							},
-						})
-
-						emitSSE("response.reasoning_summary_part.added", map[string]any{
-							"output_index":  reasoningIndex,
-							"item_id":       currentReasoningID,
-							"summary_index": 0,
-							"part": map[string]any{
-								"type": "summary_text",
-								"text": "",
-							},
-						})
-					}
-
-					isFirstChunk := accumulatedReasoning.Len() == 0
-					accumulatedReasoning.WriteString(part.Text)
-
-					streamDelta := strings.ReplaceAll(part.Text, "\n", "\n> ")
-					if isFirstChunk && strings.Contains(part.Text, "\n") && !strings.HasPrefix(strings.TrimSpace(part.Text), "**") {
-						streamDelta = "**Thinking**\n\n> " + streamDelta
-					}
-
-					// Stream thought delta to native reasoning accordion item (pE)
-					emitSSE("response.reasoning_summary_text.delta", map[string]any{
-						"output_index":  reasoningIndex,
-						"item_id":       currentReasoningID,
-						"summary_index": 0,
-						"delta":         streamDelta,
-					})
-
-					flushSSE()
+					streamThought(part.Text)
 					continue
 				}
 
@@ -464,7 +729,6 @@ func MapGeminiStreamToResponses(
 								"id":      currentMessageID,
 								"type":    "message",
 								"role":    "assistant",
-								"phase":   "final_answer",
 								"status":  "in_progress",
 								"content": []any{},
 							},
@@ -499,6 +763,14 @@ func MapGeminiStreamToResponses(
 
 				// C. Function / Tool Call Part
 				if part.FunctionCall != nil {
+					if lastGap >= 5*time.Second {
+						argBytes := 0
+						if b, err := json.Marshal(part.FunctionCall.Args); err == nil {
+							argBytes = len(b)
+						}
+						log.Printf("[Comini Stream] ⏱ functionCall %q arrived after %.1fs of upstream silence (args=%dB)",
+							part.FunctionCall.Name, lastGap.Seconds(), argBytes)
+					}
 					closeReasoning()
 					closeMessage("commentary")
 
@@ -544,7 +816,10 @@ func MapGeminiStreamToResponses(
 						sigToStore = part.ThoughtSignature
 					}
 
-					if hasMeta && meta.IsCustom {
+					if (hasMeta && meta.IsCustom) || geminiName == "apply_patch" || origName == "apply_patch" {
+						if origName == "" {
+							origName = "apply_patch"
+						}
 						// Freeform custom tool (apply_patch)
 						var inputStr string
 						if rawInput, ok := part.FunctionCall.Args["input"].(string); ok {
@@ -680,23 +955,16 @@ func MapGeminiStreamToResponses(
 							"item":         tscItem,
 						})
 
-					} else if (hasMeta && meta.IsImageGen) || geminiName == "image_generation" || origName == "image_generation" || origName == "generate_image" {
+					} else if (hasMeta && meta.IsImageGen) || geminiName == "image_generation" || origName == "image_generation" || origName == "generate_image" || geminiName == "image_gen" || origName == "image_gen" {
 						// Dedicated Image Generation Call (executed natively via Gemini Imagen)
-						prompt := ""
-						if p, ok := part.FunctionCall.Args["prompt"].(string); ok {
-							prompt = p
-						} else if q, ok := part.FunctionCall.Args["description"].(string); ok {
-							prompt = q
-						} else if q, ok := part.FunctionCall.Args["query"].(string); ok {
-							prompt = q
-						}
-						aspectRatio := ""
-						if ar, ok := part.FunctionCall.Args["aspect_ratio"].(string); ok {
-							aspectRatio = ar
-						}
+						genArgs := domain.ParseImageGenArgs(part.FunctionCall.Args)
+						prompt := genArgs.Prompt
 
 						igcItemID := randomID("igc")
 						if store != nil {
+							// Codex echoes only id/status/revised_prompt/result on later turns; keep the
+							// full args (image_paths, image_name, aspect_ratio) so history replay is faithful.
+							store.SetImageCall(part.FunctionCall.Args, igcItemID, callID)
 							store.Set(callID, sigToStore, geminiName)
 							store.Set(igcItemID, sigToStore, geminiName)
 							if sessionID != "" {
@@ -707,16 +975,20 @@ func MapGeminiStreamToResponses(
 						}
 
 						inProgItem := map[string]any{
-							"id":        igcItemID,
-							"call_id":   callID,
-							"type":      "image_generation_call",
-							"status":    "in_progress",
+							"id":      igcItemID,
+							"call_id": callID,
+							"type":    "image_generation_call",
+							"status":  "in_progress",
 						}
 
 						emitSSE("response.output_item.added", map[string]any{
 							"output_index": fcIndex,
 							"item":         inProgItem,
 						})
+						flushSSE()
+
+						// Live status so the UI shows progress while the image renders (can take 30-60s).
+						streamThought(fmt.Sprintf("**Generating image**\n%s\n", truncateRunes(strings.TrimSpace(prompt), 160)))
 						flushSSE()
 
 						var savedPath, dataURL string
@@ -726,30 +998,42 @@ func MapGeminiStreamToResponses(
 							if callCtx == nil {
 								callCtx = context.Background()
 							}
-							savedPath, dataURL, genErr = streamOpts.ImageGenFn(callCtx, prompt, aspectRatio)
+							savedPath, dataURL, genErr = streamOpts.ImageGenFn(callCtx, genArgs)
 						} else {
 							genErr = fmt.Errorf("image generation client not configured")
 						}
 
+						closeReasoning()
+						// Codex 0.163 never renders hosted image_generation_call items (measured), and it
+						// re-sends `result` in every later request. Keep the item for history but only
+						// carry the base64 payload on the legacy path.
+						handedToCodex := streamOpts.CanViewImage && genErr == nil && savedPath != ""
+						doneResult := dataURL
+						if handedToCodex {
+							doneResult = ""
+						}
 						var doneItem map[string]any
 						if genErr != nil {
 							log.Printf("[Comini ImageGen] ❌ Error generating image: %v", genErr)
 							doneItem = map[string]any{
-								"id":        igcItemID,
-								"call_id":   callID,
-								"type":      "image_generation_call",
-								"status":    "incomplete",
-								"failure":   genErr.Error(),
+								"id":      igcItemID,
+								"call_id": callID,
+								"type":    "image_generation_call",
+								"status":  "incomplete",
+								"failure": genErr.Error(),
 							}
 						} else {
 							log.Printf("[Comini ImageGen] 🎨 Successfully generated image: saved to %s (dataURL len: %d)", savedPath, len(dataURL))
+							if store != nil {
+								store.SetImageCall(part.FunctionCall.Args, savedPath)
+							}
 							doneItem = map[string]any{
 								"id":             igcItemID,
 								"call_id":        callID,
 								"type":           "image_generation_call",
 								"status":         "completed",
 								"revised_prompt": prompt,
-								"result":         dataURL,
+								"result":         doneResult,
 								"saved_path":     savedPath,
 							}
 							allGeneratedImages = append(allGeneratedImages, generatedImageRecord{
@@ -764,6 +1048,15 @@ func MapGeminiStreamToResponses(
 							"item":         doneItem,
 						})
 						flushSSE()
+
+						if handedToCodex {
+							// Codex executes view_image locally (native ImageView item in the UI) and
+							// sends the image back to the model on the next request.
+							viewedImages[savedPath] = true
+							emitFunctionCall("view_image", mustJSON(map[string]any{"path": savedPath}))
+							flushSSE()
+							continue
+						}
 
 						// Server-side Autonomous Loop: Continue with Gemini if ContinueFn is provided (unlimited loops)
 						if streamOpts.ContinueFn != nil {
@@ -988,28 +1281,36 @@ func MapGeminiStreamToResponses(
 	closeReasoning()
 	closeMessage("final_answer")
 
-	// If no message item was emitted yet (e.g. from an autonomous loop that ended without explicit text),
-	// synthesize an assistant message containing all generated images.
-	if !hasEmittedMessage && len(allGeneratedImages) > 0 {
+	// Emit any generated images that were not explicitly embedded by the model in its message text.
+	// This guarantees generated images are never swallowed even when the model emits text or tool calls alongside image_generation.
+	var unrenderedImages []generatedImageRecord
+	emittedSoFar := allEmittedText.String()
+	for _, img := range allGeneratedImages {
+		if img.SavedPath != "" && !viewedImages[img.SavedPath] && !strings.Contains(emittedSoFar, img.SavedPath) {
+			unrenderedImages = append(unrenderedImages, img)
+		}
+	}
+	if len(unrenderedImages) > 0 {
 		msgIndex := outputIndex
 		outputIndex++
 		msgID := randomID("msg")
 
 		var b strings.Builder
-		if len(allGeneratedImages) == 1 {
-			img := allGeneratedImages[0]
+		if len(unrenderedImages) == 1 {
+			img := unrenderedImages[0]
 			fileName := filepath.Base(img.SavedPath)
 			b.WriteString(fmt.Sprintf("Tôi đã tạo ảnh thành công theo yêu cầu của bạn:\n\n![%s](%s)\n\n- **Prompt:** %s\n- **File đã lưu:** [%s](%s)",
 				img.Prompt, img.SavedPath, img.Prompt, fileName, img.SavedPath))
 		} else {
-			b.WriteString(fmt.Sprintf("Tôi đã tạo thành công %d ảnh theo yêu cầu:\n\n", len(allGeneratedImages)))
-			for idx, img := range allGeneratedImages {
+			b.WriteString(fmt.Sprintf("Tôi đã tạo thành công %d ảnh theo yêu cầu:\n\n", len(unrenderedImages)))
+			for idx, img := range unrenderedImages {
 				fileName := filepath.Base(img.SavedPath)
 				b.WriteString(fmt.Sprintf("### Ảnh %d\n![%s](%s)\n- **Prompt:** %s\n- **File:** [%s](%s)\n\n",
 					idx+1, img.Prompt, img.SavedPath, img.Prompt, fileName, img.SavedPath))
 			}
 		}
 		msgText := b.String()
+		allEmittedText.WriteString(msgText)
 
 		emitSSE("response.output_item.added", map[string]any{
 			"output_index": msgIndex,
@@ -1091,7 +1392,7 @@ func MapGeminiStreamToResponses(
 	}
 
 	// Safety net: if no actionable items (no final_answer message, no tool call) were emitted,
-	// synthesize an assistant message so Codex never halts with an empty turn
+	// first try continuing via ContinueFn so Gemini emits its next tool call or final response.
 	hasActionableItem := false
 	for _, it := range completedOutputItems {
 		t, _ := it["type"].(string)
@@ -1102,22 +1403,32 @@ func MapGeminiStreamToResponses(
 		}
 	}
 
+	if !hasActionableItem && streamOpts.ContinueFn != nil && loopCount < 2 && writeErr == nil {
+		loopCount++
+		callCtx := streamOpts.Context
+		if callCtx == nil {
+			callCtx = context.Background()
+		}
+		newReader, cErr := streamOpts.ContinueFn(callCtx, domain.GeminiPart{
+			Text: "...",
+		}, "[Observation: Your previous turn produced no tool call or final output. Please immediately invoke the next tool or output your response to complete the user's request.]")
+		if cErr == nil && newReader != nil {
+			if curCloser, ok := currentReader.(io.Closer); ok {
+				_ = curCloser.Close()
+			}
+			currentReader = newReader
+			scanner = bufio.NewScanner(currentReader)
+			scanner.Buffer(buf, 20*1024*1024)
+			goto scanLoop
+		}
+	}
+
 	if !hasActionableItem {
 		msgIndex := outputIndex
 		outputIndex++
 		msgID := randomID("msg")
 
 		fallbackText := "Đang tiếp tục xử lý..."
-		if accumulatedReasoning.Len() > 0 {
-			thoughtLines := strings.Split(strings.TrimSpace(accumulatedReasoning.String()), "\n")
-			for i := len(thoughtLines) - 1; i >= 0; i-- {
-				line := strings.TrimSpace(thoughtLines[i])
-				if len(line) > 0 && len(line) < 300 && !strings.HasPrefix(line, "[") {
-					fallbackText = line
-					break
-				}
-			}
-		}
 
 		emitSSE("response.output_item.added", map[string]any{
 			"output_index": msgIndex,
@@ -1213,6 +1524,8 @@ func MapGeminiStreamToResponses(
 	}
 	log.Printf("[Comini] 📊 Tokens: input=%d (cached=%d, hit=%.1f%%) output=%d reasoning=%d",
 		inputTokens, cachedTokens, hitRate, outputTokens, reasoningTokens)
+	log.Printf("[Comini Stream] ⏱ upstream chunks=%d firstChunk=%.1fs maxGap=%.1fs total=%.1fs",
+		chunkCount, firstChunkGap.Seconds(), maxChunkGap.Seconds(), time.Since(streamStart).Seconds())
 
 	// Finalize SSE stream
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
@@ -1534,3 +1847,88 @@ func (f *streamFilter) reset() {
 	f.emitted = 0
 }
 
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// truncateRunes shortens s to at most n runes, appending an ellipsis when cut.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// normalizeThoughtDelta ensures thought headings ("**Title**\n") have a blank line after them
+// so markdown renders them as distinct paragraphs instead of run-on lines.
+func normalizeThoughtDelta(text string, atPartStart bool) string {
+	if strings.Contains(text, "**\n") && !strings.Contains(text, "**\n\n") {
+		text = strings.ReplaceAll(text, "**\n", "**\n\n")
+	}
+	return text
+}
+
+// extractReasoningHeadline extracts a concise bold heading (max ~6 words, up to 45 chars)
+// from the opening of a reasoning block, suitable for Codex Desktop's title header bar.
+func extractReasoningHeadline(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "Thinking"
+	}
+	// 1. If text already starts with markdown bold "**Headline**", extract it
+	if strings.HasPrefix(text, "**") {
+		rest := text[2:]
+		if idx := strings.Index(rest, "**"); idx > 0 {
+			headline := strings.TrimSpace(rest[:idx])
+			if headline != "" {
+				return headline
+			}
+		}
+	}
+
+	// 2. Extract from first sentence/clause
+	firstSeg := text
+	for _, delim := range []string{"\n", ".", "!", "?", ":", ";"} {
+		if idx := strings.Index(firstSeg, delim); idx != -1 {
+			firstSeg = firstSeg[:idx]
+		}
+	}
+	// Strip LaTeX math delimiters
+	firstSeg = strings.ReplaceAll(firstSeg, "$", "")
+	words := strings.Fields(firstSeg)
+	if len(words) == 0 {
+		return "Thinking"
+	}
+	if len(words) > 6 {
+		words = words[:6]
+	}
+
+	// Trim trailing English stop words so headline does not end on "regarding the", etc.
+	stopWords := map[string]bool{
+		"the": true, "a": true, "an": true, "of": true, "to": true, "in": true,
+		"for": true, "on": true, "with": true, "at": true, "by": true, "from": true,
+		"up": true, "about": true, "into": true, "over": true, "after": true,
+		"regarding": true, "concerning": true, "and": true, "or": true, "but": true,
+		"is": true, "are": true, "was": true, "were": true,
+	}
+	for len(words) > 2 && stopWords[strings.ToLower(words[len(words)-1])] {
+		words = words[:len(words)-1]
+	}
+
+	headline := strings.Join(words, " ")
+	headline = strings.TrimRight(headline, ",;:\"'`.")
+	if len(headline) > 45 {
+		headline = strings.TrimSpace(headline[:42]) + "..."
+	}
+	if len(headline) < 3 {
+		return "Thinking"
+	}
+	runes := []rune(headline)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
+}

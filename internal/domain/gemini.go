@@ -72,6 +72,7 @@ type GeminiContent struct {
 }
 
 type GeminiSystemInstruction struct {
+	Role  string       `json:"role,omitempty"`
 	Parts []GeminiPart `json:"parts"`
 }
 
@@ -135,6 +136,7 @@ type GeminiCandidate struct {
 type GeminiStreamChunk struct {
 	Candidates    []GeminiCandidate `json:"candidates,omitempty"`
 	UsageMetadata *UsageMetadata    `json:"usageMetadata,omitempty"`
+	ModelVersion  string            `json:"modelVersion,omitempty"`
 }
 
 type CCARootChunk struct {

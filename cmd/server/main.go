@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -23,17 +21,13 @@ import (
 )
 
 const (
-	Version           = "2.0.0"
+	Version           = "2.1.0"
 	LaunchAgentLabel  = "com.comini.proxy"
 	DefaultLogRelPath = ".codex/comini.log"
 )
 
 func main() {
 	args := os.Args[1:]
-	if filepath.Base(os.Args[0]) == "codex" {
-		runCodexShim(args)
-		return
-	}
 	if len(args) == 0 {
 		runServer()
 		return
@@ -54,213 +48,18 @@ func main() {
 	case "service", "daemon":
 		handleServiceCLI(args[1:])
 	case "version", "-v", "--version":
-		fmt.Printf("Comini v%s (Native Google Cloud Code Antigravity Bridge for Codex Desktop)\n", Version)
+		fmt.Printf("Comini v%s (Pure Responses API Gateway for Google Cloud Code Antigravity)\n", Version)
 	case "help", "-h", "--help":
 		printUsage()
-	case "codex-shim":
-		runCodexShim(args[1:])
 	default:
-		// If invoked via a symlink/binary named "codex", act as the codex app-server shim
-		if filepath.Base(os.Args[0]) == "codex" {
-			runCodexShim(args)
-			return
-		}
 		fmt.Fprintf(os.Stderr, "Unknown command %q\n\n", args[0])
 		printUsage()
 		os.Exit(1)
 	}
 }
 
-func runCodexShim(args []string) {
-	realBin := "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex.real"
-	if _, err := os.Stat(realBin); err != nil {
-		realBin = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
-	}
-
-	isAppServer := false
-	for _, a := range args {
-		if strings.Contains(a, "app-server") {
-			isAppServer = true
-			break
-		}
-	}
-
-	cmd := exec.Command(realBin, args...)
-	cmd.Stderr = os.Stderr
-
-	if !isAppServer {
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		if err := cmd.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			os.Exit(1)
-		}
-		return
-	}
-
-	stdinPipe, err := cmd.StdinPipe()
-	if err == nil {
-		go func() {
-			defer stdinPipe.Close()
-			buf := make([]byte, 64*1024)
-			var pending []byte
-			for {
-				n, rerr := os.Stdin.Read(buf)
-				if n > 0 {
-					pending = append(pending, buf[:n]...)
-					for {
-						idx := -1
-						for i, b := range pending {
-							if b == '\n' {
-								idx = i
-								break
-							}
-						}
-						if idx == -1 {
-							break
-						}
-						line := pending[:idx]
-						pending = pending[idx+1:]
-						s := string(line)
-						// Prevent codex app-server from attempting an upstream OAuth refresh with rt_comini_local,
-						// which would fail with 401 and wipe ~/.codex/auth.json in memory!
-						if strings.Contains(s, `"refreshToken":true`) {
-							s = strings.ReplaceAll(s, `"refreshToken":true`, `"refreshToken":false`)
-							line = []byte(s)
-						}
-						// When hostId="durable" (Cloud) queries thread/list with originators=["codex_cloud", ...],
-						// return an empty list immediately so local threads are never claimed as Cloud ("durable") threads.
-						if strings.Contains(s, `"thread/list"`) && strings.Contains(s, `"originators"`) {
-							var req map[string]any
-							if err := json.Unmarshal(line, &req); err == nil {
-								if method, _ := req["method"].(string); method == "thread/list" {
-									if params, ok := req["params"].(map[string]any); ok && params != nil {
-										if orig, hasOrig := params["originators"]; hasOrig && orig != nil {
-											resp := map[string]any{
-												"id": req["id"],
-												"result": map[string]any{
-													"data":       []any{},
-													"nextCursor": nil,
-												},
-											}
-											if out, merr := json.Marshal(resp); merr == nil {
-												_, _ = os.Stdout.Write(append(out, '\n'))
-												continue
-											}
-										}
-										delete(params, "originators")
-										if out, merr := json.Marshal(req); merr == nil {
-											line = out
-										}
-									}
-								}
-							}
-						}
-						_, _ = stdinPipe.Write(append(line, '\n'))
-					}
-				}
-				if rerr != nil {
-					if len(pending) > 0 {
-						_, _ = stdinPipe.Write(pending)
-					}
-					break
-				}
-			}
-		}()
-	}
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		cmd.Stdout = os.Stdout
-		_ = cmd.Run()
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		os.Exit(1)
-	}
-
-	go func() {
-		buf := make([]byte, 64*1024)
-		var pending []byte
-		for {
-			n, rerr := stdoutPipe.Read(buf)
-			if n > 0 {
-				pending = append(pending, buf[:n]...)
-				for {
-					idx := -1
-					for i, b := range pending {
-						if b == '\n' {
-							idx = i
-							break
-						}
-					}
-					if idx == -1 {
-						break
-					}
-					line := pending[:idx]
-					pending = pending[idx+1:]
-					outLine := transformAppServerLine(line)
-					_, _ = os.Stdout.Write(append(outLine, '\n'))
-				}
-			}
-			if rerr != nil {
-				if len(pending) > 0 {
-					_, _ = os.Stdout.Write(pending)
-				}
-				break
-			}
-		}
-	}()
-
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
-		}
-		os.Exit(1)
-	}
-}
-
-func transformAppServerLine(line []byte) []byte {
-	s := string(line)
-	if strings.Contains(s, `"userAgent"`) {
-		var msg map[string]any
-		if err := json.Unmarshal(line, &msg); err == nil {
-			if res, ok := msg["result"].(map[string]any); ok {
-				if ua, ok := res["userAgent"].(string); ok {
-					// Report 0.154.0 so kI.discover uses legacy routing and preserves http://localhost:8000/backend-api
-					if idx := strings.Index(ua, "/"); idx != -1 {
-						rest := ua[idx+1:]
-						if sp := strings.Index(rest, " "); sp != -1 {
-							res["userAgent"] = ua[:idx+1] + "0.154.0" + rest[sp:]
-						} else {
-							res["userAgent"] = ua[:idx+1] + "0.154.0"
-						}
-						if out, merr := json.Marshal(msg); merr == nil {
-							return out
-						}
-					}
-				}
-			}
-		}
-	}
-	if strings.Contains(s, `"workspaceRouting"`) {
-		var msg map[string]any
-		if err := json.Unmarshal(line, &msg); err == nil {
-			if res, ok := msg["result"].(map[string]any); ok {
-				delete(res, "workspaceRouting")
-				if out, merr := json.Marshal(msg); merr == nil {
-					return out
-				}
-			}
-		}
-	}
-	return line
-}
-
 func printUsage() {
-	fmt.Printf(`Comini v%s — Native Google Antigravity Proxy & CLI for Codex Desktop
+	fmt.Printf(`Comini v%s — Pure Responses API Gateway for Google Cloud Code Antigravity
 
 Usage:
   comini [serve]                   Run the HTTP proxy server in the foreground (default port: 9876)
@@ -285,72 +84,8 @@ Background Service (macOS LaunchAgent):
 `, Version)
 }
 
-func ensureCodexDesktopBridge(cfg *config.Config) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	codexDir := filepath.Join(home, ".codex")
-	_ = os.MkdirAll(codexDir, 0755)
-
-	email := "comini@antigravity.local"
-	if st := transport.DefaultAuthManager.Status(); st.Email != "" {
-		email = st.Email
-	}
-
-	headerB64 := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	payloadMap := map[string]any{
-		"https://api.openai.com/auth": map[string]any{
-			"chatgpt_account_id": server.CodexAccountID,
-			"chatgpt_plan_type":  "pro",
-			"chatgpt_user_id":    server.CodexUserID,
-			"user_id":            server.CodexUserID,
-		},
-		"https://api.openai.com/profile": map[string]any{
-			"email":          email,
-			"email_verified": true,
-		},
-		"iss": "https://auth.openai.com",
-		"sub": "google-oauth2|comini",
-		"iat": 1770000000,
-		"exp": 4102444800,
-	}
-	payloadBytes, _ := json.Marshal(payloadMap)
-	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadBytes)
-	jwtTok := fmt.Sprintf("%s.%s.comini_local_sig", headerB64, payloadB64)
-
-	authObj := map[string]any{
-		"auth_mode":      "chatgpt",
-		"OPENAI_API_KEY": nil,
-		"tokens": map[string]any{
-			"id_token":      jwtTok,
-			"access_token":  jwtTok,
-			"refresh_token": "rt_comini_local",
-			"account_id":    server.CodexAccountID,
-		},
-		"last_refresh": time.Now().UTC().Format(time.RFC3339),
-	}
-	if authData, err := json.MarshalIndent(authObj, "", "  "); err == nil {
-		authPath := filepath.Join(codexDir, "auth.json")
-		_ = os.WriteFile(authPath, append(authData, '\n'), 0600)
-	}
-
-	// Ensure /opt/homebrew/bin/codex symlink points to comini and set CODEX_CLI_PATH=/opt/homebrew/bin/codex
-	// so ChatGPT.app spawns our app-server shim (which strips workspaceRouting so localhost:8000 is preserved).
-	if selfExe, exeErr := os.Executable(); exeErr == nil {
-		_ = os.Symlink(selfExe, "/opt/homebrew/bin/codex")
-	}
-	_ = exec.Command("launchctl", "setenv", "CODEX_CLI_PATH", "/opt/homebrew/bin/codex").Run()
-	_ = exec.Command("launchctl", "unsetenv", "CODEX_APP_SERVER_FORCE_CLI").Run()
-
-	apiBase := "http://localhost:8000/backend-api"
-	_ = exec.Command("launchctl", "setenv", "CODEX_API_BASE_URL", apiBase).Run()
-}
-
-
 func runServer() {
 	cfg := config.Load()
-	ensureCodexDesktopBridge(cfg)
 
 	ccaClient := transport.NewCCAClient(cfg.CCABaseURL, cfg.UserAgent)
 	store := session.DefaultSignatureStore
@@ -359,7 +94,7 @@ func runServer() {
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	st := transport.DefaultAuthManager.Status()
-	log.Printf("[Comini v%s] Server listening on http://%s (and http://localhost:8000 for Codex Desktop Electron Auth)", Version, addr)
+	log.Printf("[Comini v%s] Responses API Gateway listening on http://%s", Version, addr)
 	log.Printf("[Comini v%s] Upstream CCA: %s | Default Model: %s", Version, cfg.CCABaseURL, cfg.DefaultModel)
 	if st.Authenticated {
 		log.Printf("[Comini Auth] Active Account: %s (project: %s, source: %s)", st.Email, st.ProjectID, st.Source)
@@ -367,15 +102,13 @@ func runServer() {
 		log.Printf("[Comini Auth] ⚠️ No stored OAuth token found. Run 'comini auth login' to authenticate.")
 	}
 
-	if cfg.Port != 8000 {
-		go func() {
-			if err := http.ListenAndServe("127.0.0.1:8000", router); err != nil {
-				log.Printf("[Comini] Note: secondary listener on 127.0.0.1:8000 exited: %v", err)
-			}
-		}()
+	s := &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	if err := http.ListenAndServe(addr, router); err != nil {
+	if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
@@ -414,7 +147,11 @@ func handleAuthCLI(args []string) {
 			fmt.Fprintf(os.Stderr, "❌ Failed to remove account: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("✓ Stored credential removed successfully.")
+		if target == "" || strings.EqualFold(target, "all") {
+			fmt.Println("✓ Logged out and cleared all accounts.")
+		} else {
+			fmt.Printf("✓ Removed account %s\n", target)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown auth subcommand %q\n", sub)
 		printUsage()
@@ -423,63 +160,72 @@ func handleAuthCLI(args []string) {
 }
 
 func handleAuthLogin() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	acc, err := transport.DefaultAuthManager.LoginInteractive(ctx, true)
+	fmt.Println("Initiating Google Antigravity OAuth2 flow...")
+	fmt.Println("A browser window will open shortly. Please grant permissions to continue.")
+	acc, err := transport.DefaultAuthManager.LoginInteractive(context.Background(), true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n❌ Authentication failed: %v\n", err)
 		os.Exit(1)
 	}
 
+	email := acc.Credential.Email
+	if email == "" {
+		email = acc.LoginID
+	}
 	fmt.Printf("\n✓ Successfully authenticated with Google Antigravity!\n")
-	fmt.Printf("  Account Email : %s\n", acc.Credential.Email)
-	fmt.Printf("  Account ID    : %s\n", acc.ID)
-	fmt.Printf("  Project ID    : %s\n", acc.Credential.ProjectID)
-	fmt.Printf("  Saved To      : %s\n", transport.DefaultAuthManager.AuthFilePath())
+	fmt.Printf("  Account    : %s\n", email)
+	fmt.Printf("  Account ID : %s\n", acc.ID)
+	fmt.Printf("  Project ID : %s\n", acc.Credential.ProjectID)
+	fmt.Printf("  Saved to   : %s\n\n", transport.DefaultAuthFilePath())
 }
 
 func handleAuthStatus() {
 	st := transport.DefaultAuthManager.Status()
-	fmt.Printf("=== Comini Authentication Status ===\n")
+	fmt.Println("=== Comini Authentication Status ===")
 	fmt.Printf("Auth File       : %s\n", st.AuthFilePath)
 	fmt.Printf("Authenticated   : %v\n", st.Authenticated)
-	if !st.Authenticated {
-		fmt.Println("\nRun 'comini auth login' to authenticate with your Google Antigravity account.")
-		return
+	if st.Authenticated {
+		fmt.Printf("Active Email    : %s\n", st.Email)
+		fmt.Printf("Active ID       : %s\n", st.ActiveAccountID)
+		fmt.Printf("Project ID      : %s\n", st.ProjectID)
+		fmt.Printf("Source          : %s\n", st.Source)
+		fmt.Printf("Refresh Token   : %v\n", st.HasRefreshToken)
+		if !st.ExpiresAt.IsZero() {
+			fmt.Printf("Token Expires   : %s (in %ds)\n", st.ExpiresAt.Local().Format(time.RFC3339), st.ExpiresInSec)
+		}
+	} else {
+		fmt.Println("Status          : No active credentials found. Run 'comini auth login'.")
 	}
-	fmt.Printf("Active Email    : %s\n", st.Email)
-	fmt.Printf("Active ID       : %s\n", st.ActiveAccountID)
-	fmt.Printf("Project ID      : %s\n", st.ProjectID)
-	fmt.Printf("Source          : %s\n", st.Source)
-	fmt.Printf("Refresh Token   : %v\n", st.HasRefreshToken)
-	if !st.ExpiresAt.IsZero() {
-		fmt.Printf("Token Expires   : %s (in %ds)\n", st.ExpiresAt.Local().Format(time.RFC3339), st.ExpiresInSec)
-	}
-	if len(st.Accounts) > 0 {
-		fmt.Printf("\nStored Accounts (%d):\n", len(st.Accounts))
-		for _, acc := range st.Accounts {
-			marker := " "
-			if acc.ID == st.ActiveAccountID {
-				marker = "*"
+
+	if st.TotalAccounts > 0 {
+		fmt.Printf("\nStored Accounts (%d):\n", st.TotalAccounts)
+		for _, a := range st.Accounts {
+			mark := " "
+			if a.ID == st.ActiveAccountID {
+				mark = "*"
 			}
-			fmt.Printf("  [%s] %s (id: %s, project: %s)\n", marker, acc.Credential.Email, acc.ID, acc.Credential.ProjectID)
+			email := a.Credential.Email
+			if email == "" {
+				email = a.LoginID
+			}
+			fmt.Printf("  [%s] %s (id: %s, project: %s)\n", mark, email, a.ID, a.Credential.ProjectID)
 		}
 	}
 }
 
 func handleAuthRefresh() {
-	fmt.Println("Refreshing Google Antigravity OAuth2 token...")
-	token, proj, err := transport.DefaultAuthManager.ForceRefresh()
-	if err != nil || token == "" {
+	fmt.Println("Refreshing active Google Antigravity OAuth2 access token...")
+	tok, proj, err := transport.DefaultAuthManager.ForceRefresh()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Token refresh failed: %v\n", err)
 		os.Exit(1)
 	}
 	st := transport.DefaultAuthManager.Status()
-	fmt.Printf("✓ Token refreshed and saved to %s\n", st.AuthFilePath)
-	fmt.Printf("  Account    : %s\n", st.Email)
-	fmt.Printf("  Project ID : %s\n", proj)
-	fmt.Printf("  Expires At : %s (in %ds)\n", st.ExpiresAt.Local().Format(time.RFC3339), st.ExpiresInSec)
+	fmt.Printf("✓ Successfully refreshed token for %s (project: %s)\n", st.Email, proj)
+	if len(tok) > 12 {
+		fmt.Printf("  New Access Token: %s...%s\n", tok[:8], tok[len(tok)-4:])
+	}
+	fmt.Printf("  Expires At      : %s\n", st.ExpiresAt.Local().Format(time.RFC3339))
 }
 
 func handleQuotaCLI() {
@@ -565,31 +311,42 @@ func logFilePath() string {
 }
 
 func handleServiceStatus() {
+	fmt.Printf("=== Comini LaunchAgent Service Status (%s) ===\n", LaunchAgentLabel)
+	plist := launchAgentPlistPath()
+	fmt.Printf("Plist Path : %s\n", plist)
+
+	if _, err := os.Stat(plist); os.IsNotExist(err) {
+		fmt.Println("Installed  : false (run 'comini service install' to install)")
+		return
+	}
+	fmt.Println("Installed  : true")
+
+	uid := fmt.Sprintf("gui/%d", os.Getuid())
+	out, err := exec.Command("launchctl", "print", uid+"/"+LaunchAgentLabel).CombinedOutput()
+	if err != nil {
+		fmt.Printf("Running    : false (%s)\n", strings.TrimSpace(string(out)))
+	} else {
+		state := "unknown"
+		lines := strings.Split(string(out), "\n")
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if strings.HasPrefix(l, "state =") {
+				state = strings.TrimPrefix(l, "state = ")
+				break
+			}
+		}
+		fmt.Printf("Running    : true (state: %s)\n", state)
+	}
+
 	cfg := config.Load()
-	addr := fmt.Sprintf("http://%s:%d/health", cfg.Host, cfg.Port)
+	addr := fmt.Sprintf("http://127.0.0.1:%d/health", cfg.Port)
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(addr)
-
-	fmt.Printf("=== Comini Service & Proxy Status ===\n")
-	plistPath := launchAgentPlistPath()
-	if _, statErr := os.Stat(plistPath); statErr == nil {
-		fmt.Printf("LaunchAgent     : Installed (%s)\n", plistPath)
+	if resp, err := client.Get(addr); err == nil {
+		fmt.Printf("Port %-6d: ACTIVE (HTTP %d)\n", cfg.Port, resp.StatusCode)
+		_ = resp.Body.Close()
 	} else {
-		fmt.Printf("LaunchAgent     : Not installed (run 'comini service install' to enable auto-start)\n")
+		fmt.Printf("Port %-6d: NOT RESPONDING (%v)\n", cfg.Port, err)
 	}
-
-	if err == nil && resp.StatusCode == http.StatusOK {
-		defer resp.Body.Close()
-		var health map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&health)
-		fmt.Printf("Proxy Server    : RUNNING on http://%s:%d\n", cfg.Host, cfg.Port)
-		fmt.Printf("Active Account  : %v (project: %v)\n", health["active_account"], health["project_id"])
-		fmt.Printf("Default Model   : %v\n", health["default_model"])
-	} else {
-		fmt.Printf("Proxy Server    : STOPPED on %s:%d\n", cfg.Host, cfg.Port)
-	}
-	fmt.Println()
-	handleAuthStatus()
 }
 
 func handleServiceCLI(args []string) {
@@ -623,9 +380,6 @@ func handleServiceCLI(args []string) {
 }
 
 func installService() {
-	cfg := config.Load()
-	ensureCodexDesktopBridge(cfg)
-
 	exePath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to resolve executable path: %v\n", err)
@@ -639,7 +393,6 @@ func installService() {
 		os.Exit(1)
 	}
 
-	// Copy binary to /opt/homebrew/bin/comini if writable so comini is globally available in PATH
 	targetBin := exePath
 	brewBin := "/opt/homebrew/bin/comini"
 	if exePath != brewBin {
@@ -702,7 +455,6 @@ func installService() {
 	}
 
 	if out, err := exec.Command("launchctl", "bootstrap", uid, plistPath).CombinedOutput(); err != nil {
-		// Fallback to launchctl load
 		if out2, err2 := exec.Command("launchctl", "load", "-w", plistPath).CombinedOutput(); err2 != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to load LaunchAgent: %v (%s / %s)\n", err2, string(out), string(out2))
 			os.Exit(1)

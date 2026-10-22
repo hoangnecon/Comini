@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
 	_ "image/png"
 	"os"
+	"strconv"
 
 	"sort"
 	"strings"
@@ -37,7 +37,8 @@ func generateDeterministicSignature(sessionID, callID, funcName string) string {
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
-// DeriveSessionID derives a stable session ID from Codex thread ID or first user text.
+// DeriveSessionID derives a stable session ID from Codex thread ID or first user text
+// using AGY 2.0's exact FNV-1a 64-bit hash (genairequest.hashToSessionID at 0x101f7aef0).
 func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
 	parent := strings.TrimSpace(parentThreadID)
 	own := strings.TrimSpace(ownThreadID)
@@ -45,9 +46,9 @@ func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
 	if parent != "" && own != "" {
 		seed = fmt.Sprintf("thread:%s\x00%s", parent, own)
 	} else if parent != "" {
-		seed = fmt.Sprintf("thread:%s", parent)
+		seed = parent
 	} else if own != "" {
-		seed = fmt.Sprintf("thread:%s", own)
+		seed = own
 	} else if firstUserText != "" {
 		seed = strings.TrimSpace(firstUserText)
 	}
@@ -56,10 +57,36 @@ func DeriveSessionID(parentThreadID, ownThreadID, firstUserText string) string {
 		seed = "comini-default-session"
 	}
 
+	var h uint64 = 0xcbf29ce484222325 // FNV-1a 64-bit offset basis
+	for i := 0; i < len(seed); i++ {
+		h = (h ^ uint64(seed[i])) * 0x100000001b3 // FNV-1a 64-bit prime
+	}
+	return strconv.FormatInt(int64(h), 10)
+}
 
-	digest := sha256.Sum256([]byte(seed))
-	val := binary.BigEndian.Uint64(digest[:8]) & 0x7fffffffffffffff
-	return fmt.Sprintf("-%d", val)
+// restoreImageGenArgs rebuilds the full image_generation arguments for a replayed
+// image_generation_call. Codex drops image_paths/image_name, so they are recovered from the store
+// (keyed by item id, call id or saved path); without a stored record only prompt/aspect_ratio remain.
+func restoreImageGenArgs(item domain.InputItem, prompt string, store *SignatureStore) map[string]any {
+	args := map[string]any{"prompt": prompt}
+	if store != nil {
+		if stored, ok := store.GetImageCall(item.ID, item.CallID, item.SavedPath); ok {
+			parsed := domain.ParseImageGenArgs(stored)
+			if parsed.ImageName != "" {
+				args["image_name"] = parsed.ImageName
+			}
+			if parsed.AspectRatio != "" {
+				args["aspect_ratio"] = parsed.AspectRatio
+			}
+			if len(parsed.ImagePaths) > 0 {
+				args["image_paths"] = parsed.ImagePaths
+			}
+		}
+	}
+	if _, ok := args["aspect_ratio"]; !ok && item.AspectRatio != "" {
+		args["aspect_ratio"] = item.AspectRatio
+	}
+	return args
 }
 
 func candidateNames(name string) []string {
@@ -586,41 +613,10 @@ func mergeConsecutiveRoles(contents []domain.GeminiContent) []domain.GeminiConte
 }
 
 func capAllPartsText(contents []domain.GeminiContent) []domain.GeminiContent {
-	// Standard ChatGPT / Codex context standards aligned with tool_output_token_limit:
-	// CRITICAL INVARIANT FOR PREFIX CACHING:
-	// Never mutate a historical turn's cap based on len(contents) (neither sliding nor epoch boundary),
-	// because mutating a turn after it has already been sent to Google CCA invalidates the KV prefix
-	// cache from that turn onwards!
-	// Instead, apply a single deterministic, position-invariant cap (32,000 chars ≈ 8,000 tokens per
-	// tool output, 48,000 chars for the initial prompt at index 0) the first time a part enters contents.
-	const initialTurnMaxChars = 48000
-	const standardPartMaxChars = 32000
-
-	for ci := range contents {
-		maxToolChars := standardPartMaxChars
-		if ci == 0 {
-			maxToolChars = initialTurnMaxChars
-		}
-
-		for pi := range contents[ci].Parts {
-			p := &contents[ci].Parts[pi]
-			if len(p.Text) > maxToolChars {
-				half := maxToolChars / 2
-				p.Text = p.Text[:half] + "\n\n... [output truncated for context economy] ...\n\n" + p.Text[len(p.Text)-half:]
-			}
-			if p.FunctionResponse != nil && p.FunctionResponse.Response != nil {
-				b, err := json.Marshal(p.FunctionResponse.Response)
-				if err == nil && len(b) > maxToolChars {
-					half := maxToolChars / 2
-					str := string(b)
-					truncated := str[:half] + "\n\n... [output truncated for context economy] ...\n\n" + str[len(str)-half:]
-					p.FunctionResponse.Response = map[string]any{
-						"result": truncated,
-					}
-				}
-			}
-		}
-	}
+	// Antigravity 2.0 standard:
+	// Never arbitrarily slice or truncate conversation parts, user prompts, model answers,
+	// or tool observations. All parts are preserved 100% intact up to the native 1M token
+	// context ceiling (maxCharsBudget = 3,800,000 characters).
 	return contents
 }
 
@@ -748,40 +744,109 @@ func compressOversizedImage(in *domain.GeminiInlineData) *domain.GeminiInlineDat
 	return in
 }
 
+// imageEvictionStep is the batch size used by evictStaleImages. Evicting oldest-first one image
+// at a time rewrote an early part of the prompt on every new image once the window was full,
+// which invalidated the whole KV prefix cache each turn (measured: cached 369,351 -> 10,084
+// tokens at the 17th image). Evicting in batches rewrites history only once per step.
+const imageEvictionStep = 8
+
 func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.GeminiContent {
-	// Strictly enforce a maximum total budget for image payload across the request.
-	// This guarantees images NEVER starve or displace the textual conversation history!
-	const maxTotalImageChars = 1200000 // ~300k base64 chars max for images
+	// Total image payload budget across the request (compressOversizedImage keeps each image
+	// to roughly 60-90KB of base64) so wire payloads stay well under the upstream limit.
+	const maxTotalImageChars = 1600000
 
-	keptImages := 0
-	accumulatedImageChars := 0
+	type imgRef struct{ ci, pi int }
+	var refs []imgRef // oldest -> newest
+	var sizes []int
 
-	// Scan backwards from newest (tail) to oldest (head)
-	for ci := len(contents) - 1; ci >= 0; ci-- {
-		for pi := len(contents[ci].Parts) - 1; pi >= 0; pi-- {
+	for ci := range contents {
+		for pi := range contents[ci].Parts {
 			p := &contents[ci].Parts[pi]
-			if p.InlineData != nil && len(p.InlineData.Data) > 0 {
-				validData, ok := normalizeValidBase64Image(p.InlineData.MimeType, p.InlineData.Data)
-				if !ok {
-					p.Text = "[Corrupted Base64 Image Omitted]"
-					p.InlineData = nil
-					continue
-				}
-				p.InlineData = compressOversizedImage(validData)
+			if p.InlineData == nil || len(p.InlineData.Data) == 0 {
+				continue
+			}
+			validData, ok := normalizeValidBase64Image(p.InlineData.MimeType, p.InlineData.Data)
+			if !ok {
+				p.Text = "[Corrupted Base64 Image Omitted]"
+				p.InlineData = nil
+				continue
+			}
+			p.InlineData = compressOversizedImage(validData)
+			refs = append(refs, imgRef{ci, pi})
+			sizes = append(sizes, len(p.InlineData.Data))
+		}
+	}
 
-				imgLen := len(p.InlineData.Data)
-				if keptImages < maxKeep && accumulatedImageChars+imgLen <= maxTotalImageChars {
-					keptImages++
-					accumulatedImageChars += imgLen
-				} else {
-					mime := p.InlineData.MimeType
-					p.Text = fmt.Sprintf("[Image: %s previously inspected and processed in earlier turn]", mime)
-					p.InlineData = nil
-				}
+	// Minimum number of oldest images that must go to satisfy the count and byte budgets.
+	need := 0
+	if len(refs) > maxKeep {
+		need = len(refs) - maxKeep
+	}
+	kept, total := 0, 0
+	for i := len(refs) - 1; i >= 0; i-- {
+		if kept < maxKeep && total+sizes[i] <= maxTotalImageChars {
+			kept++
+			total += sizes[i]
+			continue
+		}
+		if i+1 > need {
+			need = i + 1
+		}
+		break
+	}
+
+	// Round up to a whole batch: the evicted set only changes once every imageEvictionStep
+	// new images, so the prompt prefix stays byte-identical in between.
+	if need > 0 {
+		need = ((need + imageEvictionStep - 1) / imageEvictionStep) * imageEvictionStep
+		if need > len(refs) {
+			need = len(refs)
+		}
+	}
+
+	for i := 0; i < need; i++ {
+		p := &contents[refs[i].ci].Parts[refs[i].pi]
+		p.Text = fmt.Sprintf("[Image: %s previously inspected and processed in earlier turn]", p.InlineData.MimeType)
+		p.InlineData = nil
+	}
+	return contents
+}
+
+func isSyntheticThoughtText(raw string) bool {
+	if strings.HasPrefix(raw, "\u200b>") || strings.HasPrefix(strings.TrimLeft(raw, " \t\r\n"), "\u200b>") {
+		return true
+	}
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "**Thinking**\n\n>") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "**") && strings.Contains(trimmed, "\n\n>") {
+		return true
+	}
+	return false
+}
+
+func isSyntheticThoughtItem(item domain.InputItem) bool {
+	if strings.HasPrefix(item.ID, "msg_thought_") {
+		return true
+	}
+	if item.Role != "" && item.Role != "assistant" {
+		return false
+	}
+	if !strings.EqualFold(item.Phase, "commentary") {
+		return false
+	}
+	if item.Text != "" && isSyntheticThoughtText(item.Text) {
+		return true
+	}
+	if len(item.Content) > 0 {
+		for _, p := range extractPartsFromContent(item.Content) {
+			if p.Text != "" && isSyntheticThoughtText(p.Text) {
+				return true
 			}
 		}
 	}
-	return contents
+	return false
 }
 
 func isUserConversationalContent(c domain.GeminiContent) bool {
@@ -886,8 +951,8 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 	const maxCharsBudget = 3800000
 
 	// Stage 1: Enforce image budget.
-	// Keep at most 2 most recent images that fit under 1.2MB image budget.
-	contents = evictStaleImages(contents, 2)
+	// Keep up to 16 compressed JPEG images (~1.6MB max) so earlier turns are not mutated mid-session.
+	contents = evictStaleImages(contents, 16)
 
 	// Check if this session already has a ratcheted cutoffIndex from an earlier compaction.
 	lastCutoff := 0
@@ -991,7 +1056,80 @@ func BuildGeminiWireBodyWithItems(
 ) domain.GeminiWireBody {
 	var contents []domain.GeminiContent
 
-	// 1. Collect tool names and sanitize System Instruction
+	// 1. Parse Input Items first so we can hoist leading developer/system instructions
+	// when top-level req.Instructions is omitted (Codex 0.163.0+ with use_responses_lite=false
+	// sends base instructions and <skills_instructions> as leading role:"developer" items).
+	items := preParsedItems
+	if len(items) == 0 && len(req.Input) > 0 {
+		_ = json.Unmarshal(req.Input, &items)
+	}
+
+	normalizeType := func(t string) string {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ReplaceAll(t, "_", "")
+		t = strings.ReplaceAll(t, "-", "")
+		return t
+	}
+
+	extractItemTextOnly := func(it domain.InputItem) (string, bool) {
+		if len(it.Content) > 0 {
+			parts := extractPartsFromContent(it.Content)
+			if len(parts) == 0 {
+				return "", false
+			}
+			var texts []string
+			for _, p := range parts {
+				if p.InlineData != nil {
+					return "", false
+				}
+				if strings.TrimSpace(p.Text) != "" {
+					texts = append(texts, p.Text)
+				}
+			}
+			return strings.Join(texts, "\n\n"), len(texts) > 0
+		}
+		if strings.TrimSpace(it.Text) != "" {
+			imgs, cleaned := extractInlineDataFromText(it.Text)
+			if len(imgs) > 0 {
+				return "", false
+			}
+			cleanTxt := harness.SanitizeMessageText(cleaned)
+			return cleanTxt, strings.TrimSpace(cleanTxt) != ""
+		}
+		return "", false
+	}
+
+	effectiveInstructions := req.Instructions
+	if effectiveInstructions == nil || strings.TrimSpace(*effectiveInstructions) == "" {
+		var devTexts []string
+		hoistCount := 0
+		for hoistCount < len(items) {
+			it := items[hoistCount]
+			norm := normalizeType(it.Type)
+			role := strings.ToLower(strings.TrimSpace(it.Role))
+			isDev := norm == "system" || norm == "developer" ||
+				((norm == "message" || norm == "usermessage" || norm == "text" || norm == "inputtext" || norm == "") &&
+					(role == "developer" || role == "system"))
+			if !isDev {
+				break
+			}
+			txt, ok := extractItemTextOnly(it)
+			if !ok {
+				break
+			}
+			devTexts = append(devTexts, txt)
+			hoistCount++
+		}
+		// Only hoist leading developer/system items if at least one item remains for Contents,
+		// so we never empty Contents into a synthetic "Hello" turn.
+		if hoistCount > 0 && hoistCount < len(items) {
+			joined := strings.Join(devTexts, "\n\n")
+			effectiveInstructions = &joined
+			items = items[hoistCount:]
+		}
+	}
+
+	// 2. Collect tool names and sanitize System Instruction
 	toolNames := make([]string, 0, len(funcDecls))
 	for _, decl := range funcDecls {
 		if name, ok := decl["name"].(string); ok && name != "" {
@@ -999,7 +1137,7 @@ func BuildGeminiWireBodyWithItems(
 		}
 	}
 
-	sanitizedSys := harness.SanitizeSystemInstruction(req.Instructions, toolNames)
+	sanitizedSys := harness.SanitizeSystemInstruction(effectiveInstructions, toolNames)
 	var sysInst *domain.GeminiSystemInstruction
 	if sanitizedSys != nil {
 		txt := *sanitizedSys
@@ -1007,14 +1145,9 @@ func BuildGeminiWireBodyWithItems(
 			txt = txt[:2000000]
 		}
 		sysInst = &domain.GeminiSystemInstruction{
+			Role:  "user",
 			Parts: []domain.GeminiPart{{Text: txt}},
 		}
-	}
-
-	// 2. Parse Input Items if not already pre-parsed
-	items := preParsedItems
-	if len(items) == 0 && len(req.Input) > 0 {
-		_ = json.Unmarshal(req.Input, &items)
 	}
 
 	var currentRole string
@@ -1032,13 +1165,6 @@ func BuildGeminiWireBodyWithItems(
 	}
 
 	untrackedCalls := make(map[string]bool)
-
-	normalizeType := func(t string) string {
-		t = strings.ToLower(strings.TrimSpace(t))
-		t = strings.ReplaceAll(t, "_", "")
-		t = strings.ReplaceAll(t, "-", "")
-		return t
-	}
 
 	// Pre-index all tool calls by CallID/ID to maintain full context for observations
 	type ToolCallInfo struct {
@@ -1096,10 +1222,7 @@ func BuildGeminiWireBodyWithItems(
 				if p == "" {
 					p = it.Text
 				}
-				m := map[string]any{"prompt": p}
-				if it.AspectRatio != "" {
-					m["aspect_ratio"] = it.AspectRatio
-				}
+				m := restoreImageGenArgs(it, p, store)
 				b, _ := json.Marshal(m)
 				args = string(b)
 			}
@@ -1278,7 +1401,7 @@ func BuildGeminiWireBodyWithItems(
 			}
 
 		case "agentmessage":
-			if strings.HasPrefix(item.ID, "msg_thought_") || strings.EqualFold(item.Phase, "commentary") {
+			if isSyntheticThoughtItem(item) {
 				continue
 			}
 			if currentRole != "" && currentRole != "model" {
@@ -1303,7 +1426,7 @@ func BuildGeminiWireBodyWithItems(
 			}
 
 		case "message", "usermessage", "text", "inputtext", "":
-			if strings.HasPrefix(item.ID, "msg_thought_") || (item.Role == "assistant" && strings.EqualFold(item.Phase, "commentary")) {
+			if isSyntheticThoughtItem(item) {
 				continue
 			}
 			role := "user"
@@ -1368,10 +1491,7 @@ func BuildGeminiWireBodyWithItems(
 			if prompt == "" {
 				prompt = item.Text
 			}
-			argsMap := map[string]any{"prompt": prompt}
-			if item.AspectRatio != "" {
-				argsMap["aspect_ratio"] = item.AspectRatio
-			}
+			argsMap := restoreImageGenArgs(item, prompt, store)
 			argsJSON, _ := json.Marshal(argsMap)
 
 			if currentRole != "" && currentRole != "model" {
@@ -1660,7 +1780,7 @@ func BuildGeminiWireBodyWithItems(
 			case "auto":
 				toolConfig = &domain.GeminiToolConfig{
 					FunctionCallingConfig: &domain.GeminiFunctionCallingConfig{
-						Mode: "AUTO",
+						Mode: "VALIDATED",
 					},
 				}
 			case "required":

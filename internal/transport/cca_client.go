@@ -112,8 +112,17 @@ func (c *CCAClient) StreamGenerateContent(
 		currentBaseURL := c.baseURLs[attempt%len(c.baseURLs)]
 		url := fmt.Sprintf("%s/v1internal:streamGenerateContent?alt=sse", currentBaseURL)
 
-		log.Printf("[CCA Outbound Wire] 📡 Target: %s (attempt %d/%d) | Model: %s | payloadBytes: %d | contents: %d",
-			url, attempt+1, maxAttempts, wireModelID, len(payloadBytes), len(body.Contents))
+		thinkDesc := "none"
+		if gc := body.GenerationConfig; gc != nil && gc.ThinkingConfig != nil {
+			tc := gc.ThinkingConfig
+			budget := "nil"
+			if tc.ThinkingBudget != nil {
+				budget = fmt.Sprintf("%d", *tc.ThinkingBudget)
+			}
+			thinkDesc = fmt.Sprintf("level=%q budget=%s includeThoughts=%v", tc.ThinkingLevel, budget, tc.IncludeThoughts)
+		}
+		log.Printf("[CCA Outbound Wire] 📡 Target: %s (attempt %d/%d) | Model: %s | thinking: %s | payloadBytes: %d | contents: %d",
+			url, attempt+1, maxAttempts, wireModelID, thinkDesc, len(payloadBytes), len(body.Contents))
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
 		if err != nil {
@@ -203,11 +212,85 @@ func (c *CCAClient) StreamGenerateContent(
 	return nil, lastErr
 }
 
-// GenerateImage calls the Gemini Imagen endpoint (gemini-3.1-flash-image) and saves the result to local disk.
+// imageModelID is the model Antigravity 2.0's generate_image tool uses (GenerateContent).
+const imageModelID = "gemini-3.1-flash-image"
+
+const maxReferenceImageBytes = 20 * 1024 * 1024
+
+// resolveImagePath turns a model-supplied path (absolute, ~/..., file://..., or relative to the
+// client's working directory) into a readable local file path.
+func resolveImagePath(p, baseDir string) (string, error) {
+	p = strings.TrimSpace(p)
+	p = strings.TrimPrefix(p, "file://")
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+	if !filepath.IsAbs(p) {
+		if baseDir == "" {
+			return "", fmt.Errorf("relative image path %q cannot be resolved (working directory unknown); pass an absolute path", p)
+		}
+		p = filepath.Join(baseDir, p)
+	}
+	return p, nil
+}
+
+// loadReferenceImages reads the local source/reference images of an image request as inline data.
+func loadReferenceImages(args domain.ImageGenArgs) ([]map[string]any, error) {
+	var parts []map[string]any
+	for _, raw := range args.ImagePaths {
+		path, err := resolveImagePath(raw, args.BaseDir)
+		if err != nil {
+			return nil, err
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return nil, fmt.Errorf("reference image not found: %s", path)
+		}
+		if info.Size() == 0 || info.Size() > maxReferenceImageBytes {
+			return nil, fmt.Errorf("reference image %s has unsupported size (%d bytes; max %d)", path, info.Size(), maxReferenceImageBytes)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read reference image %s: %w", path, err)
+		}
+		mime := http.DetectContentType(data)
+		if !strings.HasPrefix(mime, "image/") {
+			return nil, fmt.Errorf("reference file %s is not an image (detected %s)", path, mime)
+		}
+		parts = append(parts, map[string]any{"inlineData": map[string]any{
+			"mimeType": mime,
+			"data":     base64.StdEncoding.EncodeToString(data),
+		}})
+	}
+	return parts, nil
+}
+
+// safeImageFileStem builds a filesystem-safe stem from the model-provided image name.
+func safeImageFileStem(name string) string {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			sb.WriteRune(r)
+		case r == '_' || r == '-' || r == ' ':
+			sb.WriteRune('_')
+		}
+		if sb.Len() >= 40 {
+			break
+		}
+	}
+	return strings.Trim(sb.String(), "_")
+}
+
+// GenerateImage calls Gemini image generation (same model and GenerateContent path as Antigravity
+// 2.0's generate_image tool) and saves the result to local disk. Reference images from
+// args.ImagePaths are sent before the text prompt, and the aspect ratio is sent as
+// generationConfig.imageConfig instead of being appended to the prompt text.
 func (c *CCAClient) GenerateImage(
 	ctx context.Context,
-	prompt string,
-	aspectRatio string,
+	args domain.ImageGenArgs,
 	authHeader string,
 	projectID string,
 ) (string, string, error) {
@@ -215,23 +298,31 @@ func (c *CCAClient) GenerateImage(
 		projectID = "aicode-consumers"
 	}
 
-	promptText := strings.TrimSpace(prompt)
-	if aspectRatio != "" && !strings.Contains(strings.ToLower(promptText), "aspect ratio") {
-		promptText = fmt.Sprintf("%s, aspect ratio: %s", promptText, aspectRatio)
+	promptText := strings.TrimSpace(args.Prompt)
+	if promptText == "" {
+		return "", "", fmt.Errorf("image prompt is empty")
+	}
+	refParts, err := loadReferenceImages(args)
+	if err != nil {
+		return "", "", err
+	}
+
+	parts := append([]map[string]any{}, refParts...)
+	parts = append(parts, map[string]any{"text": promptText})
+
+	genCfg := map[string]any{"responseModalities": []string{"IMAGE"}}
+	if ar := domain.NormalizeAspectRatio(args.AspectRatio); ar != "" {
+		genCfg["imageConfig"] = map[string]any{"aspectRatio": ar}
 	}
 
 	reqPayload := map[string]any{
 		"project": projectID,
-		"model":   "gemini-3.1-flash-image",
+		"model":   imageModelID,
 		"request": map[string]any{
 			"contents": []map[string]any{
-				{
-					"role": "user",
-					"parts": []map[string]any{
-						{"text": promptText},
-					},
-				},
+				{"role": "user", "parts": parts},
 			},
+			"generationConfig": genCfg,
 		},
 	}
 
@@ -298,7 +389,7 @@ func (c *CCAClient) GenerateImage(
 		}
 
 		if len(candidates) == 0 {
-			lastErr = fmt.Errorf("no candidates returned by image model")
+			lastErr = fmt.Errorf("no candidates returned by image model%s", imageBlockReason(root))
 			continue
 		}
 
@@ -330,7 +421,28 @@ func (c *CCAClient) GenerateImage(
 		}
 
 		if rawBase64 == "" {
-			lastErr = fmt.Errorf("no inline image data found in candidate parts")
+			// Surface why (safety block, refusal text, ...) so the model can adapt its prompt.
+			var texts []string
+			for _, pAny := range parts {
+				if pMap, _ := pAny.(map[string]any); pMap != nil {
+					if tx, ok := pMap["text"].(string); ok && strings.TrimSpace(tx) != "" {
+						texts = append(texts, strings.TrimSpace(tx))
+					}
+				}
+			}
+			reason := ""
+			if fr, ok := cand0["finishReason"].(string); ok && fr != "" {
+				reason = " finishReason=" + fr
+			}
+			msg := "image model returned no image" + reason
+			if len(texts) > 0 {
+				joined := strings.Join(texts, " ")
+				if len(joined) > 400 {
+					joined = joined[:400] + "…"
+				}
+				msg += ": " + joined
+			}
+			lastErr = fmt.Errorf("%s", msg)
 			continue
 		}
 
@@ -347,7 +459,11 @@ func (c *CCAClient) GenerateImage(
 		if strings.Contains(mimeType, "png") {
 			ext = ".png"
 		}
-		fileName := fmt.Sprintf("img_%d_%s%s", time.Now().Unix(), strings.TrimPrefix(genRequestID(), "agent/")[:8], ext)
+		stem := safeImageFileStem(args.ImageName)
+		if stem == "" {
+			stem = "img"
+		}
+		fileName := fmt.Sprintf("%s_%d_%s%s", stem, time.Now().Unix(), strings.TrimPrefix(genRequestID(), "agent/")[:8], ext)
 		savedPath := filepath.Join(imagesDir, fileName)
 
 		if err := os.WriteFile(savedPath, imgBytes, 0644); err != nil {
@@ -537,4 +653,16 @@ func (c *CCAClient) FetchUserQuotaSummary(ctx context.Context, authHeader string
 	return nil, fmt.Errorf("failed to retrieve user quota summary from CCA")
 }
 
-
+// imageBlockReason describes a prompt-level block (promptFeedback.blockReason) in an image response.
+func imageBlockReason(root map[string]any) string {
+	pf, _ := root["promptFeedback"].(map[string]any)
+	if pf == nil {
+		if r, ok := root["response"].(map[string]any); ok {
+			pf, _ = r["promptFeedback"].(map[string]any)
+		}
+	}
+	if br, ok := pf["blockReason"].(string); ok && br != "" {
+		return " (blockReason=" + br + ")"
+	}
+	return ""
+}

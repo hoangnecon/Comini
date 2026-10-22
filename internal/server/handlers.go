@@ -98,11 +98,13 @@ func (h *Handlers) getOrFetchQuotaSnapshot(ctx context.Context) *cachedQuotaSnap
 	}
 
 	snap := *fallback
+	hasGemini := false
 	if err == nil && summary != nil {
 		snap.Summary = summary
 		for _, g := range summary.Groups {
 			for _, b := range g.Buckets {
 				if b.BucketID == "gemini-5h" {
+					hasGemini = true
 					used := int(math.Round((1.0 - b.RemainingFraction) * 100.0))
 					if used < 0 {
 						used = 0
@@ -139,11 +141,40 @@ func (h *Handlers) getOrFetchQuotaSnapshot(ctx context.Context) *cachedQuotaSnap
 				}
 			}
 		}
-		snap.FetchedAt = time.Now()
-		h.quotaMu.Lock()
-		h.quotaCache = &snap
-		h.quotaMu.Unlock()
 	}
+
+	// Live fallback matching AGY 2.0: if retrieveUserQuotaSummary omitted gemini-5h,
+	// query fetchAvailableModels directly to extract exact Gemini model quotaInfo.
+	if !hasGemini && h.ccaClient != nil {
+		if models, merr := h.ccaClient.FetchQuotaAndModels(fetchCtx, "Bearer "+token, proj); merr == nil {
+			for _, m := range models {
+				if strings.Contains(m.ModelID, "gemini") && m.RemainingFraction > 0 && m.ResetTime != "" {
+					used := int(math.Round((1.0 - m.RemainingFraction) * 100.0))
+					if used < 0 {
+						used = 0
+					}
+					if used > 100 {
+						used = 100
+					}
+					snap.PrimaryUsedPercent = used
+					if t, parseErr := time.Parse(time.RFC3339, m.ResetTime); parseErr == nil {
+						snap.PrimaryResetAt = t.Unix()
+						after := int(time.Until(t).Seconds())
+						if after < 0 {
+							after = 0
+						}
+						snap.PrimaryResetAfterSec = after
+					}
+					break
+				}
+			}
+		}
+	}
+
+	snap.FetchedAt = time.Now()
+	h.quotaMu.Lock()
+	h.quotaCache = &snap
+	h.quotaMu.Unlock()
 
 	return &snap
 }
@@ -160,10 +191,6 @@ func (h *Handlers) HandleModels(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(raw)
 			return
 		}
-	}
-	if r.URL.Path == "/models" {
-		h.HandleTppModels(w, r)
-		return
 	}
 
 	makeEntry := func(id string) domain.ModelCatalogEntry {
@@ -301,93 +328,11 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(req.Input, &parsedInputItems)
 	}
 
-	// 1. Collect all tools from top-level req.Tools and dynamic tool items (additional_tools, tool_search_output).
-	// Keep discovered dynamic tools across all turns in the session so wireBody.Tools and SystemInstruction
-	// do not mutate when the user sends a follow-up message (preserving 100% of the prefix KV cache).
-	allToolDefs := make([]domain.ToolDefinition, 0, len(req.Tools))
-	allToolDefs = append(allToolDefs, req.Tools...)
-
-	for _, item := range parsedInputItems {
-		norm := strings.ToLower(strings.TrimSpace(item.Type))
-		norm = strings.ReplaceAll(norm, "_", "")
-		norm = strings.ReplaceAll(norm, "-", "")
-
-		if norm == "additionaltools" || norm == "toolsearchoutput" || norm == "toolsearch" {
-			if len(item.Tools) > 0 {
-				allToolDefs = append(allToolDefs, item.Tools...)
-			}
-			// Also check if tools are inside item.Output or item.Payload
-			if len(item.Tools) == 0 {
-				if len(item.Output) > 0 {
-					var toolContainer struct {
-						Tools []domain.ToolDefinition `json:"tools"`
-					}
-					if err := json.Unmarshal(item.Output, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
-						allToolDefs = append(allToolDefs, toolContainer.Tools...)
-					} else {
-						var toolList []domain.ToolDefinition
-						if err := json.Unmarshal(item.Output, &toolList); err == nil && len(toolList) > 0 {
-							allToolDefs = append(allToolDefs, toolList...)
-						}
-					}
-				}
-				if len(item.Payload) > 0 {
-					var toolContainer struct {
-						Tools []domain.ToolDefinition `json:"tools"`
-					}
-					if err := json.Unmarshal(item.Payload, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
-						allToolDefs = append(allToolDefs, toolContainer.Tools...)
-					} else {
-						var toolList []domain.ToolDefinition
-						if err := json.Unmarshal(item.Payload, &toolList); err == nil && len(toolList) > 0 {
-							allToolDefs = append(allToolDefs, toolList...)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Ensure image_generation tool is declared so Gemini can generate images
-	hasImageGen := false
-	for _, t := range allToolDefs {
-		if t.Type == "image_generation" || t.Name == "image_generation" {
-			hasImageGen = true
-			break
-		}
-	}
-	if !hasImageGen {
-		allToolDefs = append(allToolDefs, domain.ToolDefinition{
-			Type: "image_generation",
-			Name: "image_generation",
-		})
-	}
-
-	// 2. Compile Tool Declarations
-	funcDecls, toolMetaMap := schema.ExtractAndCompileTools(allToolDefs)
-
-	// 3. Resolve Model and Effort
-	effort := ""
-	if req.Reasoning != nil {
-		effort = req.Reasoning.Effort
-	}
-	if effort == "" && req.ReasoningEffort != "" {
-		effort = req.ReasoningEffort
-	}
-	if effort == "" {
-		for _, it := range parsedInputItems {
-			if it.Type == "reasoning" && it.Effort != "" {
-				effort = it.Effort
-				break
-			}
-		}
-	}
-	resolved := transport.ResolveModelAndEffort(req.Model, effort)
-	log.Printf("[Comini] 🎯 Request received: model=%s effort=%s -> Gemini wireModel=%s thinkingLevel=%s (tools=%d)",
-		req.Model, effort, resolved.WireModelID, resolved.ThinkingLevel, len(funcDecls))
-
-	// 4. Derive Session ID
+	// 1. Derive Session ID first so session-sticky discovered tools can be loaded/persisted
 	parentThreadID := r.Header.Get("x-codex-parent-thread-id")
+	if parentThreadID == "" && len(req.ClientMetadata) > 0 {
+		parentThreadID = req.ClientMetadata["x-codex-parent-thread-id"]
+	}
 	ownThreadID := r.Header.Get("session_id")
 	if ownThreadID == "" {
 		ownThreadID = r.Header.Get("x-session-id")
@@ -403,6 +348,32 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if ownThreadID == "" {
 		ownThreadID = r.Header.Get("x-codex-own-thread-id")
+	}
+	if ownThreadID == "" && req.PromptCacheKey != "" {
+		ownThreadID = strings.TrimSpace(req.PromptCacheKey)
+	}
+	if ownThreadID == "" && len(req.ClientMetadata) > 0 {
+		for _, k := range []string{"session_id", "thread_id", "conversation_id", "x-codex-thread-id", "x-codex-own-thread-id", "x-codex-window-id"} {
+			if v := strings.TrimSpace(req.ClientMetadata[k]); v != "" {
+				ownThreadID = v
+				break
+			}
+		}
+		if ownThreadID == "" {
+			if tm := req.ClientMetadata["x-codex-turn-metadata"]; tm != "" {
+				var metaObj struct {
+					SessionID string `json:"session_id"`
+					ThreadID  string `json:"thread_id"`
+				}
+				if err := json.Unmarshal([]byte(tm), &metaObj); err == nil {
+					if metaObj.SessionID != "" {
+						ownThreadID = metaObj.SessionID
+					} else if metaObj.ThreadID != "" {
+						ownThreadID = metaObj.ThreadID
+					}
+				}
+			}
+		}
 	}
 	var firstUserText string
 	for _, item := range parsedInputItems {
@@ -431,6 +402,133 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		firstUserText = parsedInputItems[0].ID
 	}
 	sessionID := session.DeriveSessionID(parentThreadID, ownThreadID, firstUserText)
+
+	// 2. Collect all tools from top-level req.Tools and dynamic tool items (additional_tools, tool_search_output).
+	// Persist discovered dynamic tools across all turns in the session so wireBody.Tools never shrinks or mutates
+	// when tool_search_output items are compacted away (preserving prefix KV cache stability).
+	allToolDefs := make([]domain.ToolDefinition, 0, len(req.Tools))
+	allToolDefs = append(allToolDefs, req.Tools...)
+
+	var discoveredTools []domain.ToolDefinition
+	for _, item := range parsedInputItems {
+		norm := strings.ToLower(strings.TrimSpace(item.Type))
+		norm = strings.ReplaceAll(norm, "_", "")
+		norm = strings.ReplaceAll(norm, "-", "")
+
+		if norm == "additionaltools" || norm == "toolsearchoutput" || norm == "toolsearch" {
+			if len(item.Tools) > 0 {
+				discoveredTools = append(discoveredTools, item.Tools...)
+			}
+			// Also check if tools are inside item.Output or item.Payload
+			if len(item.Tools) == 0 {
+				if len(item.Output) > 0 {
+					var toolContainer struct {
+						Tools []domain.ToolDefinition `json:"tools"`
+					}
+					if err := json.Unmarshal(item.Output, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+						discoveredTools = append(discoveredTools, toolContainer.Tools...)
+					} else {
+						var toolList []domain.ToolDefinition
+						if err := json.Unmarshal(item.Output, &toolList); err == nil && len(toolList) > 0 {
+							discoveredTools = append(discoveredTools, toolList...)
+						}
+					}
+				}
+				if len(item.Payload) > 0 {
+					var toolContainer struct {
+						Tools []domain.ToolDefinition `json:"tools"`
+					}
+					if err := json.Unmarshal(item.Payload, &toolContainer); err == nil && len(toolContainer.Tools) > 0 {
+						discoveredTools = append(discoveredTools, toolContainer.Tools...)
+					} else {
+						var toolList []domain.ToolDefinition
+						if err := json.Unmarshal(item.Payload, &toolList); err == nil && len(toolList) > 0 {
+							discoveredTools = append(discoveredTools, toolList...)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(req.Tools) > 0 && h.store != nil && sessionID != "" {
+		h.store.RecordSessionTools(sessionID, req.Tools)
+	}
+	if len(discoveredTools) > 0 && h.store != nil && sessionID != "" {
+		h.store.RecordSessionTools(sessionID, discoveredTools)
+	}
+
+	hasToolHistory := false
+	for _, it := range parsedInputItems {
+		norm := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(it.Type), "_", ""), "-", ""))
+		if norm == "functioncall" || norm == "customtoolcall" || norm == "imagegenerationcall" || norm == "toolsearchcall" || norm == "functioncalloutput" || norm == "customtoolcalloutput" {
+			hasToolHistory = true
+			break
+		}
+	}
+	isCompaction := req.Instructions != nil && (strings.Contains(strings.ToLower(*req.Instructions), "compact") || strings.Contains(strings.ToLower(*req.Instructions), "summariz"))
+
+	if (len(req.Tools) > 0 || len(discoveredTools) > 0 || hasToolHistory) && !isCompaction {
+		if h.store != nil && sessionID != "" {
+			if stickyTools := h.store.GetSessionTools(sessionID); len(stickyTools) > 0 {
+				allToolDefs = append(allToolDefs, stickyTools...)
+			}
+		}
+		if len(allToolDefs) == 0 && hasToolHistory {
+			allToolDefs = append(allToolDefs, schema.DefaultCodexDesktopTools()...)
+		}
+		if len(discoveredTools) > 0 {
+			allToolDefs = append(allToolDefs, discoveredTools...)
+		}
+
+		// Ensure image_generation tool is declared on normal tool-enabled turns so Gemini can generate images
+		hasImageGen := false
+		for _, t := range allToolDefs {
+			if t.Type == "image_generation" || t.Name == "image_generation" {
+				hasImageGen = true
+				break
+			}
+		}
+		if !hasImageGen {
+			allToolDefs = append(allToolDefs, domain.ToolDefinition{
+				Type: "image_generation",
+				Name: "image_generation",
+			})
+		}
+	}
+
+	// 3. Compile Tool Declarations
+	funcDecls, toolMetaMap := schema.ExtractAndCompileTools(allToolDefs)
+
+	// Codex only renders generated images natively through its own `view_image` tool,
+	// so the proxy hands images back through it when the client declared that tool.
+	canViewImage := false
+	for _, d := range funcDecls {
+		if name, _ := d["name"].(string); name == "view_image" {
+			canViewImage = true
+			break
+		}
+	}
+
+	// 4. Resolve Model and Effort
+	effort := ""
+	if req.Reasoning != nil {
+		effort = req.Reasoning.Effort
+	}
+	if effort == "" && req.ReasoningEffort != "" {
+		effort = req.ReasoningEffort
+	}
+	if effort == "" {
+		for _, it := range parsedInputItems {
+			if it.Type == "reasoning" && it.Effort != "" {
+				effort = it.Effort
+				break
+			}
+		}
+	}
+	resolved := transport.ResolveModelAndEffort(req.Model, effort)
+	log.Printf("[Comini] 🎯 Request received: model=%s effort=%s -> Gemini wireModel=%s thinkingLevel=%s (tools=%d)",
+		req.Model, effort, resolved.WireModelID, resolved.ThinkingLevel, len(funcDecls))
 
 
 	// 5. Build Wire Body using parsedInputItems (single-pass, zero redundant allocations)
@@ -556,9 +654,13 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var imageGenFn func(ctx context.Context, prompt string, aspectRatio string) (string, string, error)
+	clientCWD := extractClientCWD(parsedInputItems)
+	var imageGenFn func(ctx context.Context, args domain.ImageGenArgs) (string, string, error)
 	if h.ccaClient != nil {
-		imageGenFn = func(ctx context.Context, prompt, ar string) (string, string, error) {
+		imageGenFn = func(ctx context.Context, args domain.ImageGenArgs) (string, string, error) {
+			if args.BaseDir == "" {
+				args.BaseDir = clientCWD
+			}
 			curAuth := authHeader
 			curProj := projectID
 			if h.authMgr != nil {
@@ -569,7 +671,7 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			savedPath, dataURL, err := h.ccaClient.GenerateImage(ctx, prompt, ar, curAuth, curProj)
+			savedPath, dataURL, err := h.ccaClient.GenerateImage(ctx, args, curAuth, curProj)
 			if err != nil && h.authMgr != nil && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED")) {
 				freshToken, freshProj, refreshErr := h.authMgr.ForceRefresh()
 				if refreshErr == nil && freshToken != "" {
@@ -577,7 +679,7 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 						curProj = freshProj
 					}
 					curAuth = "Bearer " + freshToken
-					savedPath, dataURL, err = h.ccaClient.GenerateImage(ctx, prompt, ar, curAuth, curProj)
+					savedPath, dataURL, err = h.ccaClient.GenerateImage(ctx, args, curAuth, curProj)
 				}
 			}
 			return savedPath, dataURL, err
@@ -636,9 +738,58 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	_ = streaming.MapGeminiStreamToResponses(
 		resp.Body, w, flushFn, h.store, "", req.Model, toolMetaMap, sessionID,
 		streaming.StreamOptions{
-			Context:    r.Context(),
-			ImageGenFn: imageGenFn,
-			ContinueFn: continueFn,
+			Context:      r.Context(),
+			ImageGenFn:   imageGenFn,
+			ContinueFn:   continueFn,
+			CanViewImage: canViewImage,
 		},
 	)
+}
+
+// extractClientCWD finds the client's working directory in the `<cwd>...</cwd>` block Codex
+// puts in its environment context message. It is used to resolve relative reference-image paths.
+func extractClientCWD(items []domain.InputItem) string {
+	find := func(txt string) string {
+		if i := strings.Index(txt, "<cwd>"); i >= 0 {
+			rest := txt[i+len("<cwd>"):]
+			if j := strings.Index(rest, "</cwd>"); j >= 0 {
+				return strings.TrimSpace(rest[:j])
+			}
+		}
+		return ""
+	}
+	// Newest context wins: Codex re-emits the block when the directory changes.
+	for i := len(items) - 1; i >= 0; i-- {
+		it := items[i]
+		if it.Role == "assistant" {
+			continue
+		}
+		if c := find(it.Text); c != "" {
+			return c
+		}
+		if len(it.Content) > 0 {
+			var parts []domain.ContentPart
+			if err := json.Unmarshal(it.Content, &parts); err == nil {
+				for _, p := range parts {
+					if c := find(p.Text); c != "" {
+						return c
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// HandleFallbackJSON returns standard 404 JSON for unhandled endpoints on the Responses API gateway.
+func (h *Handlers) HandleFallbackJSON(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("Endpoint %s not supported on Comini Responses API gateway", r.URL.Path),
+			"type":    "invalid_request_error",
+			"code":    "not_found",
+		},
+	})
 }

@@ -552,8 +552,84 @@ func TestToolChoiceMapping(t *testing.T) {
 	if cfg.Mode != "ANY" {
 		t.Errorf("expected ANY, got %s", cfg.Mode)
 	}
-	if len(cfg.AllowedFunctionNames) == 0 || cfg.AllowedFunctionNames[0] != "default_api:exec_cmd" {
-		t.Errorf("expected default_api:exec_cmd in allowedFunctionNames, got %+v", cfg.AllowedFunctionNames)
+	// 3. Tool choice "auto" -> mode "VALIDATED" (matching AGY 2.0 buildToolConfig at 0x101991aa0)
+	req3 := domain.ResponsesRequest{
+		Model:      "gemini-3.7-flash",
+		ToolChoice: "auto",
+		Input:      json.RawMessage(`[{"type":"message","role":"user","content":"hi"}]`),
+	}
+	body3 := session.BuildGeminiWireBody(&req3, "sess_tc3", funcDecls, "high", nil)
+	if body3.ToolConfig == nil || body3.ToolConfig.FunctionCallingConfig == nil || body3.ToolConfig.FunctionCallingConfig.Mode != "VALIDATED" {
+		t.Errorf("expected VALIDATED for auto tool choice, got %+v", body3.ToolConfig)
+	}
+}
+
+func TestCodex0163DeveloperInstructionsHoistedAndPromptCacheKey(t *testing.T) {
+	funcDecls := []map[string]any{
+		{"name": "exec_command", "description": "run command"},
+	}
+
+	// Simulate Codex 0.163.0+ with use_responses_lite=false:
+	// - Instructions is nil
+	// - Leading items are role:"developer" (base instructions + skills instructions)
+	// - Followed by role:"user" (<environment_context> + user prompt)
+	inputJSON := `[
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, an agent based on GPT-6.\nAlways verify your work."}]},
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"<skills_instructions>\nSkill catalog here\n</skills_instructions>"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/Users/hoangnguyen142/Work/Comini</cwd>\n</environment_context>"},{"type":"input_text","text":"Check git status"}]}
+	]`
+
+	var req domain.ResponsesRequest
+	rawReq := fmt.Sprintf(`{
+		"model": "gpt-6",
+		"prompt_cache_key": "01a15562-f495-7690-aaa9-04d146725e1f",
+		"client_metadata": {
+			"x-codex-window-id": "01a15562-f495-7690-aaa9-04d146725e1f:0",
+			"x-codex-turn-metadata": "{\"session_id\":\"01a15562-f495-7690-aaa9-04d146725e1f\"}"
+		},
+		"input": %s
+	}`, inputJSON)
+	if err := json.Unmarshal([]byte(rawReq), &req); err != nil {
+		t.Fatalf("unmarshal req failed: %v", err)
+	}
+	if req.PromptCacheKey != "01a15562-f495-7690-aaa9-04d146725e1f" {
+		t.Fatalf("expected PromptCacheKey parsed, got %q", req.PromptCacheKey)
+	}
+	if req.ClientMetadata["x-codex-window-id"] == "" {
+		t.Fatalf("expected ClientMetadata parsed, got %+v", req.ClientMetadata)
+	}
+
+	// Verify AGY 2.0 FNV-1a 64-bit session ID derivation
+	sid := session.DeriveSessionID("", req.PromptCacheKey, "fallback")
+	if sid == "" || sid == "0" {
+		t.Fatalf("expected non-empty FNV-1a session ID, got %q", sid)
+	}
+
+	body := session.BuildGeminiWireBody(&req, sid, funcDecls, "HIGH", nil)
+	if body.SystemInstruction == nil || len(body.SystemInstruction.Parts) == 0 {
+		t.Fatalf("expected leading developer messages to be hoisted into SystemInstruction")
+	}
+	if body.SystemInstruction.Role != "user" {
+		t.Fatalf("expected SystemInstruction.Role == 'user' (matching AGY 2.0), got %q", body.SystemInstruction.Role)
+	}
+	sysText := body.SystemInstruction.Parts[0].Text
+	if strings.Contains(sysText, "based on GPT-6") {
+		t.Fatalf("expected GPT-6 branding sanitized in hoisted SystemInstruction, got: %s", sysText)
+	}
+	if !strings.Contains(sysText, "<skills_instructions>") {
+		t.Fatalf("expected <skills_instructions> in hoisted SystemInstruction, got: %s", sysText)
+	}
+	if !strings.Contains(sysText, "Tool contract:") {
+		t.Fatalf("expected BuildToolCatalogNudge in SystemInstruction, got: %s", sysText)
+	}
+	// Verify developer messages were removed from Contents[0] so they are not duplicated!
+	if len(body.Contents) != 1 {
+		t.Fatalf("expected 1 user turn in Contents after hoisting developer items, got %d", len(body.Contents))
+	}
+	for _, p := range body.Contents[0].Parts {
+		if strings.Contains(p.Text, "<skills_instructions>") || strings.Contains(p.Text, "Always verify your work") {
+			t.Fatalf("expected hoisted developer text NOT to be duplicated in Contents[0], got: %s", p.Text)
+		}
 	}
 }
 
@@ -1082,7 +1158,7 @@ func TestEvictStaleImages(t *testing.T) {
 	})
 
 	dummyBase64 := strings.Repeat("A", 100000) // 100KB base64 image data
-	for i := 1; i <= 8; i++ {
+	for i := 1; i <= 20; i++ {
 		callID := fmt.Sprintf("call_img_%d", i)
 		store.Set(callID, fmt.Sprintf("sig_img_%d", i), "view_image")
 		items = append(items, domain.InputItem{
@@ -1117,13 +1193,14 @@ func TestEvictStaleImages(t *testing.T) {
 		}
 	}
 
-	// When 8 images exist, only the latest 2 should retain InlineData.
-	// The older 6 should be evicted to placeholders.
-	if imageCount != 2 {
-		t.Fatalf("expected exactly 2 recent images with InlineData, got %d", imageCount)
+	// 20 images exceed the 16-image window by 4. Eviction is batched (imageEvictionStep = 8) so the
+	// prompt prefix only changes once per batch: the oldest 8 are evicted and the newest 12 kept.
+	// (Per-image eviction used to rewrite early history on every new image and drop the KV cache.)
+	if imageCount != 12 {
+		t.Fatalf("expected exactly 12 recent images with InlineData, got %d", imageCount)
 	}
-	if placeholderCount != 6 {
-		t.Fatalf("expected 6 evicted image placeholders, got %d", placeholderCount)
+	if placeholderCount != 8 {
+		t.Fatalf("expected 8 evicted image placeholders, got %d", placeholderCount)
 	}
 }
 

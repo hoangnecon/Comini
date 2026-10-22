@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"comini/internal/domain"
 )
 
 type callEntry struct {
@@ -16,10 +18,20 @@ type callEntry struct {
 	Timestamp    time.Time `json:"ts"`
 }
 
+// imageCallEntry keeps the full argument set of an image_generation call. Codex only echoes
+// id/status/revised_prompt/result back in later requests, so image_paths/image_name/aspect_ratio
+// would otherwise be lost from the replayed history.
+type imageCallEntry struct {
+	Args      map[string]any `json:"args"`
+	Timestamp time.Time      `json:"ts"`
+}
+
 type persistedStoreData struct {
-	Calls          map[string]callEntry `json:"calls"`
-	BySessionCall  map[string]string    `json:"by_session_call"`
-	SessionCutoffs map[string]int       `json:"session_cutoffs,omitempty"`
+	ImageCalls     map[string]imageCallEntry          `json:"image_calls,omitempty"`
+	Calls          map[string]callEntry               `json:"calls"`
+	BySessionCall  map[string]string                  `json:"by_session_call"`
+	SessionCutoffs map[string]int                     `json:"session_cutoffs,omitempty"`
+	SessionTools   map[string][]domain.ToolDefinition `json:"session_tools,omitempty"`
 }
 
 type SignatureStore struct {
@@ -27,6 +39,8 @@ type SignatureStore struct {
 	calls          map[string]callEntry
 	bySessionCall  map[string]string
 	sessionCutoffs map[string]int
+	sessionTools   map[string][]domain.ToolDefinition
+	imageCalls     map[string]imageCallEntry
 	filePath       string
 	ttl            time.Duration
 }
@@ -49,6 +63,8 @@ func NewSignatureStore(ttl time.Duration) *SignatureStore {
 		calls:          make(map[string]callEntry),
 		bySessionCall:  make(map[string]string),
 		sessionCutoffs: make(map[string]int),
+		sessionTools:   make(map[string][]domain.ToolDefinition),
+		imageCalls:     make(map[string]imageCallEntry),
 		filePath:       filePath,
 		ttl:            ttl,
 	}
@@ -58,6 +74,9 @@ func NewSignatureStore(ttl time.Duration) *SignatureStore {
 
 func (s *SignatureStore) pruneExpiredLocked() {
 	now := time.Now()
+	if s.imageCalls == nil {
+		s.imageCalls = make(map[string]imageCallEntry)
+	}
 	for id, entry := range s.calls {
 		if now.Sub(entry.Timestamp) > s.ttl {
 			delete(s.calls, id)
@@ -87,6 +106,46 @@ func (s *SignatureStore) pruneExpiredLocked() {
 	if len(s.sessionCutoffs) > 2000 {
 		s.sessionCutoffs = make(map[string]int)
 	}
+	if len(s.sessionTools) > 500 {
+		s.sessionTools = make(map[string][]domain.ToolDefinition)
+	}
+	for id, entry := range s.imageCalls {
+		if now.Sub(entry.Timestamp) > s.ttl {
+			delete(s.imageCalls, id)
+		}
+	}
+	if len(s.imageCalls) > 5000 {
+		s.imageCalls = make(map[string]imageCallEntry)
+	}
+}
+
+// SetImageCall records the full image_generation arguments under every given key (item id,
+// call id, saved path) so later history replays can restore image_paths/image_name/aspect_ratio.
+func (s *SignatureStore) SetImageCall(args map[string]any, keys ...string) {
+	if len(args) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range keys {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		s.imageCalls[k] = imageCallEntry{Args: args, Timestamp: time.Now()}
+	}
+	s.saveLocked()
+}
+
+// GetImageCall returns the stored image_generation arguments for the first key that matches.
+func (s *SignatureStore) GetImageCall(keys ...string) (map[string]any, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, k := range keys {
+		if e, ok := s.imageCalls[k]; ok && time.Since(e.Timestamp) <= s.ttl {
+			return e.Args, true
+		}
+	}
+	return nil, false
 }
 
 func (s *SignatureStore) load() {
@@ -110,6 +169,12 @@ func (s *SignatureStore) load() {
 		if p.SessionCutoffs != nil {
 			s.sessionCutoffs = p.SessionCutoffs
 		}
+		if p.SessionTools != nil {
+			s.sessionTools = p.SessionTools
+		}
+		if p.ImageCalls != nil {
+			s.imageCalls = p.ImageCalls
+		}
 		s.pruneExpiredLocked()
 	}
 }
@@ -123,6 +188,8 @@ func (s *SignatureStore) saveLocked() {
 		Calls:          s.calls,
 		BySessionCall:  s.bySessionCall,
 		SessionCutoffs: s.sessionCutoffs,
+		SessionTools:   s.sessionTools,
+		ImageCalls:     s.imageCalls,
 	}
 	data, err := json.Marshal(p)
 	if err == nil {
@@ -276,12 +343,59 @@ func (s *SignatureStore) SetSessionCutoff(sessionID string, cutoff int) {
 	s.saveLocked()
 }
 
+func (s *SignatureStore) RecordSessionTools(sessionID string, tools []domain.ToolDefinition) {
+	if s == nil || sessionID == "" || len(tools) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionTools == nil {
+		s.sessionTools = make(map[string][]domain.ToolDefinition)
+	}
+	existing := s.sessionTools[sessionID]
+	seen := make(map[string]bool, len(existing))
+	for _, t := range existing {
+		if t.Name != "" {
+			seen[t.Name] = true
+		}
+	}
+	changed := false
+	for _, t := range tools {
+		if t.Name != "" && !seen[t.Name] {
+			seen[t.Name] = true
+			existing = append(existing, t)
+			changed = true
+		}
+	}
+	if changed {
+		s.sessionTools[sessionID] = existing
+		s.saveLocked()
+	}
+}
+
+func (s *SignatureStore) GetSessionTools(sessionID string) []domain.ToolDefinition {
+	if s == nil || sessionID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tools := s.sessionTools[sessionID]
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]domain.ToolDefinition, len(tools))
+	copy(out, tools)
+	return out
+}
+
 func (s *SignatureStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = make(map[string]callEntry)
 	s.bySessionCall = make(map[string]string)
 	s.sessionCutoffs = make(map[string]int)
+	s.sessionTools = make(map[string][]domain.ToolDefinition)
+	s.imageCalls = make(map[string]imageCallEntry)
 	s.saveLocked()
-}
 
+}

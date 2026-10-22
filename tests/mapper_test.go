@@ -278,7 +278,9 @@ func TestGeneratedImageTagExtraction(t *testing.T) {
 	capturedPrompt := ""
 	capturedAR := ""
 	streamOpts := &streaming.StreamOptions{
-		ImageGenFn: func(ctx context.Context, prompt string, aspectRatio string) (string, string, error) {
+		ImageGenFn: func(ctx context.Context, a domain.ImageGenArgs) (string, string, error) {
+			prompt, aspectRatio := a.Prompt, a.AspectRatio
+			_, _ = prompt, aspectRatio
 			capturedPrompt = prompt
 			capturedAR = aspectRatio
 			return "/tmp/scene_13.jpg", "data:image/jpeg;base64,mockdata", nil

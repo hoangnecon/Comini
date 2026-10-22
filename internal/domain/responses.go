@@ -19,6 +19,8 @@ type ResponsesRequest struct {
 	ReasoningEffort    string                 `json:"reasoning_effort,omitempty"`
 	PreviousResponseID string                 `json:"previous_response_id,omitempty"`
 	Store              *bool                  `json:"store,omitempty"`
+	PromptCacheKey     string                 `json:"prompt_cache_key,omitempty"`
+	ClientMetadata     map[string]string      `json:"client_metadata,omitempty"`
 }
 
 type ReasoningConfig struct {

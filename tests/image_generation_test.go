@@ -62,7 +62,9 @@ data: [DONE]
 	}
 
 	mockGenCalled := false
-	mockGenFn := func(ctx context.Context, prompt, ar string) (string, string, error) {
+	mockGenFn := func(ctx context.Context, a domain.ImageGenArgs) (string, string, error) {
+		prompt, ar := a.Prompt, a.AspectRatio
+		_, _ = prompt, ar
 		mockGenCalled = true
 		if prompt != "A fluffy cat sitting in sunlight" {
 			t.Errorf("unexpected prompt: %s", prompt)
@@ -131,7 +133,9 @@ data: [DONE]
 `
 
 	var generatedPrompts []string
-	mockGenFn := func(ctx context.Context, prompt, ar string) (string, string, error) {
+	mockGenFn := func(ctx context.Context, a domain.ImageGenArgs) (string, string, error) {
+		prompt, ar := a.Prompt, a.AspectRatio
+		_, _ = prompt, ar
 		generatedPrompts = append(generatedPrompts, prompt)
 		if prompt == "Frame 01: Hero enters cave" {
 			return "/tmp/frame_01.jpg", "data:image/jpeg;base64,frame1", nil
@@ -213,9 +217,10 @@ data: [DONE]
 		t.Errorf("missing response.completed event in output")
 	}
 
-	// Verify only 1 assistant message item was added (added + done + response.completed = 3)
-	if strings.Count(res, `"type":"message"`) != 3 {
-		t.Errorf("expected exactly 1 assistant message created (3 occurrences), got: %d", strings.Count(res, `"type":"message"`))
+	// Verify only 1 final-answer message item was completed (done + response.completed = 2,
+	// while output_item.added omits phase until the message completes so commentary vs final_answer is accurate).
+	if strings.Count(res, `"phase":"final_answer"`) != 2 {
+		t.Errorf("expected exactly 1 final_answer message completed (2 occurrences), got: %d", strings.Count(res, `"phase":"final_answer"`))
 	}
 }
 
@@ -227,7 +232,9 @@ func TestImageGenerationAutonomousLoop_TerminalSynthesizedMessage(t *testing.T) 
 	stream3 := `data: [DONE]
 `
 
-	mockGenFn := func(ctx context.Context, prompt, ar string) (string, string, error) {
+	mockGenFn := func(ctx context.Context, a domain.ImageGenArgs) (string, string, error) {
+		prompt, ar := a.Prompt, a.AspectRatio
+		_, _ = prompt, ar
 		if prompt == "Apple" {
 			return "/tmp/apple.jpg", "data:image/jpeg;base64,apple", nil
 		}

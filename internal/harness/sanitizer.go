@@ -40,27 +40,27 @@ func SanitizeMessageText(text string) string {
 }
 
 // BuildToolCatalogNudge constructs explicit tool catalog contract steering Gemini to use native tools.
+// Kept static (independent of dynamic toolNames list) so SystemInstruction never mutates mid-session when tool_search discovers tools, preserving 100% of the prefix KV cache.
 func BuildToolCatalogNudge(toolNames []string) string {
 	if len(toolNames) == 0 {
 		return ""
 	}
-	quoted := make([]string, len(toolNames))
-	for i, name := range toolNames {
-		quoted[i] = "`" + name + "`"
+	nudge := "Tool contract: use the current declared tool catalog as ground truth. Call only declared tool names with their declared schema argument keys."
+	for _, n := range toolNames {
+		if n == "image_generation" || n == "generate_image" {
+			// Older replayed history may show image calls with only a prompt; make the full schema explicit.
+			nudge += " image_generation: whenever the user provides or refers to an existing image, pass its local file path(s) in image_paths (max 3) to edit or use it as a reference, even if earlier calls in the history only show a prompt."
+			break
+		}
 	}
-	return "Tool contract: use the current tool catalog as ground truth. Valid tool names for this turn are exactly " +
-		strings.Join(quoted, ", ") +
-		". Call only listed names with their listed argument keys."
+	return nudge
 }
 
 // SanitizeSystemInstruction preserves the full system prompt while removing any trailing Claude artifacts that trigger upstream rejections.
 func SanitizeSystemInstruction(instructions *string, toolNames []string) *string {
-	if instructions == nil {
-		return nil
-	}
-	baseText := *instructions
-	if strings.TrimSpace(baseText) == "" {
-		return nil
+	var baseText string
+	if instructions != nil {
+		baseText = *instructions
 	}
 
 	cleaned := billingHeaderRegex.ReplaceAllString(baseText, "")
@@ -79,6 +79,10 @@ func SanitizeSystemInstruction(instructions *string, toolNames []string) *string
 	nudge := BuildToolCatalogNudge(toolNames)
 	if nudge != "" {
 		parts = append(parts, nudge)
+	}
+
+	if len(parts) == 0 {
+		return nil
 	}
 
 	res := strings.Join(parts, "\n\n")

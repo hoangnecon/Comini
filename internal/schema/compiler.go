@@ -192,27 +192,42 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 			}
 			metaMap[sanitized] = meta
 			metaMap[origName] = meta
+			metaMap["image_gen"] = meta
+			metaMap["generate_image"] = meta
 			if seenDecls[sanitized] {
 				return
 			}
 			seenDecls[sanitized] = true
+			// Parameters mirror Antigravity 2.0's generate_image tool (AGY hub binary):
+			// Prompt (required), ImageName (required), AspectRatio (enum, default 1:1) and
+			// ImagePaths (max 3 local source/reference images). Descriptions are AGY's own text.
 			params := map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"prompt": map[string]any{
 						"type":        "STRING",
-						"description": "The detailed visual prompt describing the image to generate.",
+						"description": "The text prompt to generate an image for or the edit instructions.",
+					},
+					"image_name": map[string]any{
+						"type":        "STRING",
+						"description": "Name of the generated image to save. Should be all lowercase with underscores, describing what the image contains. Maximum 3 words. Example: 'login_page_mockup'",
 					},
 					"aspect_ratio": map[string]any{
 						"type":        "STRING",
-						"description": "Aspect ratio of the generated image. Supported values: '1:1', '16:9', '4:3', '3:4', '9:16'. Defaults to '1:1'.",
+						"description": "Optional aspect ratio for the generated image. Supported values: '1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9'. Default is '1:1'.",
+						"enum":        domain.SupportedImageAspectRatios,
+					},
+					"image_paths": map[string]any{
+						"type":        "ARRAY",
+						"description": "Absolute paths of local images to edit, combine, or use as references (at most 3).",
+						"items":       map[string]any{"type": "STRING"},
 					},
 				},
 				"required": []string{"prompt"},
 			}
 			desc := t.Description
 			if desc == "" {
-				desc = "Generate high-quality images using Google Gemini Imagen model based on a descriptive text prompt. Use this tool whenever the user asks to draw, generate, paint, or create an image or illustration."
+				desc = "Generate an image or edit existing images based on a text prompt. The resulting image will be saved as an artifact for use. You can use this tool to generate user interfaces and iterate on a design with the USER for an application or website that you are building. When creating UI designs, generate only the interface itself without surrounding device frames (laptops, phones, tablets, etc.) unless the user explicitly requests them. You can also use this tool to generate assets for use in an application or website. Pass source or reference images via image_paths (also aliased as `image_gen`)."
 			}
 			decls = append(decls, map[string]any{
 				"name":        sanitized,
@@ -247,7 +262,8 @@ func ExtractAndCompileTools(toolDefs []domain.ToolDefinition) ([]map[string]any,
 				OriginalName:  origName,
 				Namespace:     ns,
 				CanonicalName: canonicalName,
-				IsImageGen:    (origName == "image_generation" || origName == "generate_image"),
+				IsCustom:      (origName == "apply_patch"),
+				IsImageGen:    (origName == "image_generation" || origName == "generate_image" || origName == "image_gen"),
 			}
 			metaMap[sanitized] = meta
 			metaMap[canonicalName] = meta
@@ -421,4 +437,90 @@ func cleanSchemaNode(node any) map[string]any {
 	}
 
 	return out
+}
+
+// DefaultCodexDesktopTools returns the core Codex Desktop tool definitions as a fallback
+// when an active responses_lite session omits top-level tools on continuation turns.
+func DefaultCodexDesktopTools() []domain.ToolDefinition {
+	return []domain.ToolDefinition{
+		{
+			Type:        "function",
+			Name:        "exec_command",
+			Description: "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cmd":               map[string]any{"type": "string", "description": "Shell command to execute."},
+					"workdir":           map[string]any{"type": "string", "description": "Optional working directory to run the command in."},
+					"shell":             map[string]any{"type": "string", "description": "Shell binary to launch."},
+					"yield_time_ms":     map[string]any{"type": "number", "description": "How long to wait (in milliseconds) for output before yielding."},
+					"max_output_tokens": map[string]any{"type": "number", "description": "Maximum number of tokens to return."},
+					"tty":               map[string]any{"type": "boolean", "description": "Whether to allocate a TTY for the command."},
+				},
+				"required": []any{"cmd"},
+			},
+		},
+		{
+			Type:        "function",
+			Name:        "write_stdin",
+			Description: "Writes characters to an existing unified_exec session and returns recent output.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"session_id":        map[string]any{"type": "number", "description": "Identifier of the running unified_exec session."},
+					"chars":             map[string]any{"type": "string", "description": "Bytes to write to stdin (may be empty to poll)."},
+					"yield_time_ms":     map[string]any{"type": "number", "description": "How long to wait (in milliseconds) for output before yielding."},
+					"max_output_tokens": map[string]any{"type": "number", "description": "Maximum number of tokens to return."},
+				},
+				"required": []any{"session_id"},
+			},
+		},
+		{
+			Type: "custom",
+			Name: "apply_patch",
+		},
+		{
+			Type:        "function",
+			Name:        "update_plan",
+			Description: "Updates the task plan.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"explanation": map[string]any{"type": "string"},
+					"plan": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"step":   map[string]any{"type": "string"},
+								"status": map[string]any{"type": "string", "enum": []any{"pending", "in_progress", "completed"}},
+							},
+							"required": []any{"step", "status"},
+						},
+					},
+				},
+				"required": []any{"plan"},
+			},
+		},
+		{
+			Type:        "function",
+			Name:        "view_image",
+			Description: "View a local image from the filesystem.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{"type": "string", "description": "Local filesystem path to an image file."},
+				},
+				"required": []any{"path"},
+			},
+		},
+		{
+			Type: "tool_search",
+			Name: "tool_search",
+		},
+		{
+			Type: "image_generation",
+			Name: "image_generation",
+		},
+	}
 }
