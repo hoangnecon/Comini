@@ -632,7 +632,7 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	defer resp.Body.Close()
 
-	// 8. Stream Responses API SSE (with live x-codex rate-limit headers for Codex session token_count updates)
+	// 8. Stream Responses API SSE (with live x-codex & standard x-ratelimit headers for Codex session token_count & /status UI)
 	snap := h.getOrFetchQuotaSnapshot(r.Context())
 	w.Header().Set("x-codex-primary-used-percent", fmt.Sprintf("%d", snap.PrimaryUsedPercent))
 	w.Header().Set("x-codex-primary-window-minutes", "300")
@@ -640,6 +640,31 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("x-codex-secondary-used-percent", fmt.Sprintf("%d", snap.WeeklyUsedPercent))
 	w.Header().Set("x-codex-secondary-window-minutes", "10080")
 	w.Header().Set("x-codex-secondary-reset-at", fmt.Sprintf("%d", snap.WeeklyResetAt))
+
+	// Standard OpenAI & Codex Responses API rate-limit headers (consumed by account/rateLimits/read for /status UI)
+	const baseTokenLimit = 1000000
+	remTokens := int(float64(baseTokenLimit) * (1.0 - float64(snap.PrimaryUsedPercent)/100.0))
+	if remTokens < 0 {
+		remTokens = 0
+	}
+	resetSec := snap.PrimaryResetAfterSec
+	if resetSec < 1 {
+		resetSec = 1
+	}
+	resetTokensStr := fmt.Sprintf("%ds", resetSec)
+
+	w.Header().Set("x-ratelimit-limit-tokens", fmt.Sprintf("%d", baseTokenLimit))
+	w.Header().Set("x-ratelimit-remaining-tokens", fmt.Sprintf("%d", remTokens))
+	w.Header().Set("x-ratelimit-reset-tokens", resetTokensStr)
+	w.Header().Set("x-ratelimit-limit-requests", "10000")
+	remReq := 10000 - snap.PrimaryUsedPercent*100
+	if remReq < 0 {
+		remReq = 0
+	}
+	w.Header().Set("x-ratelimit-remaining-requests", fmt.Sprintf("%d", remReq))
+	w.Header().Set("x-ratelimit-reset-requests", resetTokensStr)
+	w.Header().Set("x-ratelimit-limit-tokens-usage-based", fmt.Sprintf("%d", baseTokenLimit))
+	w.Header().Set("x-ratelimit-remaining-tokens-usage-based", fmt.Sprintf("%d", remTokens))
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")

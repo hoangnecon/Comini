@@ -1505,13 +1505,24 @@ scanLoop:
 			"model":      modelName,
 			"output":     completedOutputItems,
 			"usage": map[string]any{
-				"input_tokens":  inputTokens,
-				"output_tokens": outputTokens + reasoningTokens,
-				"total_tokens":  inputTokens + outputTokens + reasoningTokens,
+				"input_tokens":          inputTokens,
+				"output_tokens":         outputTokens + reasoningTokens,
+				"total_tokens":          inputTokens + outputTokens + reasoningTokens,
+				"input_token_count":     inputTokens,
+				"output_token_count":    outputTokens + reasoningTokens,
+				"cached_token_count":    cachedTokens,
+				"reasoning_token_count": reasoningTokens,
+				"total_token_count":     inputTokens + outputTokens + reasoningTokens,
 				"input_tokens_details": map[string]any{
 					"cached_tokens": cachedTokens,
 				},
+				"input_token_details": map[string]any{
+					"cached_tokens": cachedTokens,
+				},
 				"output_tokens_details": map[string]any{
+					"reasoning_tokens": reasoningTokens,
+				},
+				"output_token_details": map[string]any{
 					"reasoning_tokens": reasoningTokens,
 				},
 			},

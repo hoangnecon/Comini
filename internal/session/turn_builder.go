@@ -334,6 +334,10 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 						cleanMap[k] = fmt.Sprintf("[Attached Image: %s loaded into vision encoder]", mime)
 						continue
 					}
+					if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+						cleanMap[k] = "[Remote image URL omitted; inline data URL required]"
+						continue
+					}
 				}
 			}
 			if k == "source" {
