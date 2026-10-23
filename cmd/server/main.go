@@ -44,7 +44,7 @@ func main() {
 	case "status":
 		handleServiceStatus()
 	case "quota", "models":
-		handleQuotaCLI()
+		handleQuotaCLI(args[1:])
 	case "service", "daemon":
 		handleServiceCLI(args[1:])
 	case "version", "-v", "--version":
@@ -228,12 +228,54 @@ func handleAuthRefresh() {
 	fmt.Printf("  Expires At      : %s\n", st.ExpiresAt.Local().Format(time.RFC3339))
 }
 
-func handleQuotaCLI() {
-	token, proj, err := transport.DefaultAuthManager.GetCredentials()
-	if err != nil || token == "" {
-		fmt.Fprintf(os.Stderr, "❌ Not authenticated: %v\n", err)
-		os.Exit(1)
+func handleQuotaCLI(args []string) {
+	target := ""
+	if len(args) > 0 {
+		target = strings.TrimSpace(args[0])
 	}
+
+	if strings.EqualFold(target, "all") {
+		accounts := transport.DefaultAuthManager.GetAllAccounts()
+		if len(accounts) == 0 {
+			fmt.Println("No stored accounts found.")
+			return
+		}
+		for i, email := range accounts {
+			if i > 0 {
+				fmt.Println()
+			}
+			queryAndPrintAccountQuota(email)
+		}
+		return
+	}
+
+	queryAndPrintAccountQuota(target)
+}
+
+func queryAndPrintAccountQuota(target string) {
+	var token, proj, email string
+	var err error
+
+	if target == "" {
+		st := transport.DefaultAuthManager.Status()
+		email = st.Email
+		proj = st.ProjectID
+		token, proj, err = transport.DefaultAuthManager.GetCredentials()
+	} else {
+		var creds *transport.TargetAccountCreds
+		creds, err = transport.DefaultAuthManager.GetCredentialsForAccount(target)
+		if err == nil {
+			email = creds.Email
+			proj = creds.ProjectID
+			token = creds.Token
+		}
+	}
+
+	if err != nil || token == "" {
+		fmt.Fprintf(os.Stderr, "❌ Failed to get credentials: %v\n", err)
+		return
+	}
+
 	cfg := config.Load()
 	client := transport.NewCCAClient(cfg.CCABaseURL, cfg.UserAgent)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -241,63 +283,230 @@ func handleQuotaCLI() {
 
 	models, err := client.FetchQuotaAndModels(ctx, "Bearer "+token, proj)
 	if err != nil && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED")) {
-		if freshToken, freshProj, refErr := transport.DefaultAuthManager.ForceRefresh(); refErr == nil && freshToken != "" {
-			token = freshToken
-			proj = freshProj
-			models, err = client.FetchQuotaAndModels(ctx, "Bearer "+freshToken, freshProj)
+		if target == "" {
+			if freshToken, freshProj, refErr := transport.DefaultAuthManager.ForceRefresh(); refErr == nil && freshToken != "" {
+				token = freshToken
+				proj = freshProj
+				models, err = client.FetchQuotaAndModels(ctx, "Bearer "+freshToken, freshProj)
+			}
 		}
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to query quota from Google CCA: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "❌ Failed to query quota from Google CCA for %s: %v\n", email, err)
+		return
 	}
 
 	summary, _ := client.FetchUserQuotaSummary(ctx, "Bearer "+token, proj)
 
-	sort.Slice(models, func(i, j int) bool {
-		return models[i].ModelID < models[j].ModelID
+	renderQuotaDashboard(email, proj, summary, models)
+}
+
+func renderQuotaDashboard(email, proj string, summary *transport.UserQuotaSummary, models []transport.QuotaModelInfo) {
+	bold := "\033[1m"
+	reset := "\033[0m"
+	cyan := "\033[36m"
+	gray := "\033[90m"
+
+	fmt.Printf("%s┌────────────────────────────────────────────────────────────────────────┐%s\n", cyan, reset)
+	fmt.Printf("%s│%s  %sComini Quota Inspector — Google Cloud Code Antigravity%s               %s│%s\n", cyan, reset, bold, reset, cyan, reset)
+	fmt.Printf("%s│%s  Account: %s%-32s%s • Project: %-19s %s│%s\n", cyan, reset, bold, email, reset, proj, cyan, reset)
+	fmt.Printf("%s└────────────────────────────────────────────────────────────────────────┘%s\n\n", cyan, reset)
+
+	if summary != nil && len(summary.Groups) > 0 {
+		fmt.Printf("📊 %sQUOTA POOLS%s\n", bold, reset)
+		for _, g := range summary.Groups {
+			fmt.Printf("  ✦ %s%s%s\n", bold, g.DisplayName, reset)
+			for idx, b := range g.Buckets {
+				tree := "├─"
+				if idx == len(g.Buckets)-1 {
+					tree = "└─"
+				}
+				remPct := int(math.Round(b.RemainingFraction * 100.0))
+				if remPct < 0 {
+					remPct = 0
+				}
+				if remPct > 100 {
+					remPct = 100
+				}
+				bar := renderProgressBar(remPct, 14)
+				color := colorForPct(remPct)
+				resetStr := formatResetTime(b.ResetTime)
+				winName := formatWindowName(b.Window)
+				fmt.Printf("    %s %-15s: [%s] %s%3d%% remaining%s (resets %s)\n",
+					tree, winName, bar, color, remPct, reset, resetStr)
+			}
+			fmt.Println()
+		}
+	}
+
+	var activeModels []transport.QuotaModelInfo
+	for _, m := range models {
+		if isCurrentActiveModel(m.ModelID) {
+			activeModels = append(activeModels, m)
+		}
+	}
+
+	sort.Slice(activeModels, func(i, j int) bool {
+		return activeModels[i].ModelID < activeModels[j].ModelID
 	})
 
-	st := transport.DefaultAuthManager.Status()
-	fmt.Printf("=== Google Antigravity Quota (Account: %s | Project: %s) ===\n\n", st.Email, proj)
-	if summary != nil && len(summary.Groups) > 0 {
-		fmt.Printf("%-26s | %-12s | %-10s | %-10s | %-20s\n", "QUOTA GROUP", "WINDOW", "USED", "REMAINING", "RESET TIME")
-		fmt.Println(strings.Repeat("-", 90))
-		for _, g := range summary.Groups {
-			for _, b := range g.Buckets {
-				remPct := int(math.Round(b.RemainingFraction * 100.0))
-				usedPct := 100 - remPct
-				resetStr := b.ResetTime
-				if resetStr != "" {
-					if t, err := time.Parse(time.RFC3339, resetStr); err == nil {
-						dur := time.Until(t).Round(time.Minute)
-						resetStr = fmt.Sprintf("%s (%s)", t.Local().Format("01-02 15:04"), dur)
-					}
-				} else {
-					resetStr = "-"
-				}
-				fmt.Printf("%-26s | %-12s | %-10s | %-10s | %-20s\n",
-					g.DisplayName, b.Window, fmt.Sprintf("%d%%", usedPct), fmt.Sprintf("%d%%", remPct), resetStr)
+	if len(activeModels) > 0 {
+		fmt.Printf("🚀 %sACTIVE MODELS (%d)%s\n", bold, len(activeModels), reset)
+		fmt.Printf("  %-30s %-16s %-12s %-20s\n", "MODEL", "TIER / EFFORT", "REMAINING", "RESET TIME")
+		fmt.Printf("  %s%s%s\n", gray, strings.Repeat("─", 80), reset)
+		for _, m := range activeModels {
+			cleanName, tier := cleanDisplayNameAndTier(m.ModelID, m.DisplayName)
+			remPct := int(math.Round(m.RemainingFraction * 100.0))
+			if remPct < 0 {
+				remPct = 0
 			}
+			if remPct > 100 {
+				remPct = 100
+			}
+			color := colorForPct(remPct)
+			resetStr := formatResetTime(m.ResetTime)
+			fmt.Printf("  %-30s %-16s %s%3d%%%s          %-20s\n",
+				cleanName, tier, color, remPct, reset, resetStr)
 		}
 		fmt.Println()
 	}
+}
 
-	fmt.Printf("%-34s | %-28s | %-10s | %-20s\n", "WIRE MODEL ID", "DISPLAY NAME", "REMAINING", "RESET TIME")
-	fmt.Println(strings.Repeat("-", 102))
-	for _, m := range models {
-		pct := fmt.Sprintf("%.0f%%", m.RemainingFraction*100)
-		resetStr := m.ResetTime
-		if resetStr != "" {
-			if t, err := time.Parse(time.RFC3339, resetStr); err == nil {
-				dur := time.Until(t).Round(time.Minute)
-				resetStr = fmt.Sprintf("%s (%s)", t.Local().Format("15:04"), dur)
-			}
-		} else {
-			resetStr = "-"
-		}
-		fmt.Printf("%-34s | %-28s | %-10s | %-20s\n", m.ModelID, m.DisplayName, pct, resetStr)
+func isCurrentActiveModel(modelID string) bool {
+	id := strings.ToLower(modelID)
+	// Filter out internal / legacy / dev artifacts
+	if strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_") {
+		return false
 	}
+	// Filter out discontinued 2.5, 3.1, 3.5, legacy 3-flash, tiered, extra-low, disabled
+	if strings.Contains(id, "2.5") || strings.Contains(id, "3.1") || strings.Contains(id, "3.5") {
+		return false
+	}
+	if strings.Contains(id, "disabled") || strings.Contains(id, "tiered") || strings.Contains(id, "extra-low") {
+		return false
+	}
+	if id == "gemini-3-flash" || id == "gemini-3-flash-agent" {
+		return false
+	}
+	return true
+}
+
+func cleanDisplayNameAndTier(id, name string) (cleanName, tier string) {
+	lower := strings.ToLower(id)
+
+	switch {
+	case strings.HasSuffix(lower, "-high"):
+		tier = "High"
+	case strings.HasSuffix(lower, "-medium"):
+		tier = "Medium"
+	case strings.HasSuffix(lower, "-low"):
+		tier = "Low"
+	case strings.Contains(lower, "thinking"):
+		tier = "Thinking"
+	default:
+		tier = "Default"
+	}
+
+	switch {
+	case strings.Contains(lower, "claude-opus-5-5"):
+		cleanName = "Claude Opus 5.5"
+	case strings.Contains(lower, "claude-sonnet-5-5"):
+		cleanName = "Claude Sonnet 5.5"
+	case strings.Contains(lower, "gemini-4-argon"):
+		cleanName = "Gemini 4 Argon"
+	case strings.Contains(lower, "gemini-3.8-flash"):
+		cleanName = "Gemini 3.8 Flash"
+	case strings.Contains(lower, "claude-opus-4-6"):
+		cleanName = "Claude Opus 4.6 (Thinking)"
+	case strings.Contains(lower, "claude-sonnet-4-6"):
+		cleanName = "Claude Sonnet 4.6"
+	case strings.Contains(lower, "gpt-oss-120b"):
+		cleanName = "GPT-OSS 120B"
+	default:
+		if name != "" {
+			cleanName = name
+		} else {
+			cleanName = id
+		}
+	}
+	return
+}
+
+func formatWindowName(w string) string {
+	switch strings.ToLower(w) {
+	case "5h", "5-hour", "5hour":
+		return "5-Hour Window"
+	case "weekly", "week", "7d":
+		return "Weekly Window"
+	default:
+		return w
+	}
+}
+
+func formatDurationHuman(d time.Duration) string {
+	if d <= 0 {
+		return "now"
+	}
+	m := int(d.Minutes())
+	h := m / 60
+	days := h / 24
+	if days > 0 {
+		remH := h % 24
+		if remH > 0 {
+			return fmt.Sprintf("%dd %dh", days, remH)
+		}
+		return fmt.Sprintf("%dd", days)
+	}
+	if h > 0 {
+		remM := m % 60
+		if remM > 0 {
+			return fmt.Sprintf("%dh %dm", h, remM)
+		}
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dm", m)
+}
+
+func formatResetTime(resetStr string) string {
+	if resetStr == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, resetStr)
+	if err != nil {
+		return resetStr
+	}
+	dur := time.Until(t)
+	if dur <= 0 {
+		return "now"
+	}
+	durStr := formatDurationHuman(dur)
+	locT := t.Local()
+	now := time.Now()
+	if locT.Year() == now.Year() && locT.YearDay() == now.YearDay() {
+		return fmt.Sprintf("in %s (%s)", durStr, locT.Format("15:04"))
+	}
+	return fmt.Sprintf("in %s (%s %s)", durStr, locT.Format("01-02"), locT.Format("15:04"))
+}
+
+func renderProgressBar(pct int, width int) string {
+	filled := (pct * width) / 100
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+	return strings.Repeat("█", filled) + strings.Repeat("░", empty)
+}
+
+func colorForPct(pct int) string {
+	if pct >= 50 {
+		return "\033[32m"
+	} else if pct >= 20 {
+		return "\033[33m"
+	}
+	return "\033[31m"
 }
 
 func launchAgentPlistPath() string {

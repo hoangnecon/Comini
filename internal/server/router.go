@@ -27,6 +27,27 @@ func NewRouter(h *Handlers) http.Handler {
 	mux.HandleFunc("/v1/models", h.HandleModels)
 	mux.HandleFunc("/responses", h.HandleResponses)
 	mux.HandleFunc("/v1/responses", h.HandleResponses)
+
+	// Codex Desktop and app-server native quota/rate-limits endpoints
+	mux.HandleFunc("/wham/usage", h.HandleWhamUsage)
+	mux.HandleFunc("/api/codex/usage", h.HandleWhamUsage)
+	mux.HandleFunc("/backend-api/wham/usage", h.HandleWhamUsage)
+	mux.HandleFunc("/v1/wham/usage", h.HandleWhamUsage)
+	mux.HandleFunc("/v1/api/codex/usage", h.HandleWhamUsage)
+
+	mux.HandleFunc("/wham/rate-limit-reset-credits", h.HandleRateLimitResetCredits)
+	mux.HandleFunc("/api/codex/rate-limit-reset-credits", h.HandleRateLimitResetCredits)
+	mux.HandleFunc("/backend-api/wham/rate-limit-reset-credits", h.HandleRateLimitResetCredits)
+	mux.HandleFunc("/v1/wham/rate-limit-reset-credits", h.HandleRateLimitResetCredits)
+	mux.HandleFunc("/v1/api/codex/rate-limit-reset-credits", h.HandleRateLimitResetCredits)
+
+	// Remote plugin service & telemetry
+	mux.HandleFunc("/api/codex/ps/mcp", h.HandlePsMcp)
+	mux.HandleFunc("/codex/analytics-events/events", h.HandleAnalyticsEvents)
+	mux.HandleFunc("/api/codex/settings/user", h.HandleEmptyObject)
+	mux.HandleFunc("/ps/plugins/", h.HandleEmptyArray)
+	mux.HandleFunc("/plugins/featured", h.HandleEmptyArray)
+
 	mux.HandleFunc("/", h.HandleFallbackJSON)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

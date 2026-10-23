@@ -807,3 +807,86 @@ func (a *AuthManager) refreshOAuthToken(refreshToken string) (string, time.Time,
 	expires := time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	return payload.AccessToken, expires, nil
 }
+
+type TargetAccountCreds struct {
+	ID        string
+	Email     string
+	ProjectID string
+	Token     string
+}
+
+// GetCredentialsForAccount returns credentials for a specific account email or ID without changing the active account.
+func (a *AuthManager) GetCredentialsForAccount(query string) (*TargetAccountCreds, error) {
+	a.loadStoredCredential()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var matched *AccountEntry
+	for i := range a.store.GoogleAntigravity.Accounts {
+		acc := &a.store.GoogleAntigravity.Accounts[i]
+		if strings.EqualFold(acc.ID, query) || strings.EqualFold(acc.Credential.Email, query) {
+			matched = acc
+			break
+		}
+	}
+	if matched == nil {
+		return nil, fmt.Errorf("account %q not found in stored accounts", query)
+	}
+
+	proj := matched.Credential.ProjectID
+	if proj == "" {
+		proj = "aicode-consumers"
+	}
+
+	exp := time.UnixMilli(int64(matched.Credential.Expires))
+	if matched.Credential.Access != "" && !exp.IsZero() && time.Now().Before(exp.Add(-3*time.Minute)) {
+		return &TargetAccountCreds{
+			ID:        matched.ID,
+			Email:     matched.Credential.Email,
+			ProjectID: proj,
+			Token:     matched.Credential.Access,
+		}, nil
+	}
+
+	if matched.Credential.Refresh != "" {
+		newToken, newExp, err := a.refreshOAuthToken(matched.Credential.Refresh)
+		if err == nil && newToken != "" {
+			matched.Credential.Access = newToken
+			matched.Credential.Expires = float64(newExp.UnixMilli())
+			_ = a.saveLocked()
+			return &TargetAccountCreds{
+				ID:        matched.ID,
+				Email:     matched.Credential.Email,
+				ProjectID: proj,
+				Token:     newToken,
+			}, nil
+		}
+	}
+
+	if matched.Credential.Access != "" {
+		return &TargetAccountCreds{
+			ID:        matched.ID,
+			Email:     matched.Credential.Email,
+			ProjectID: proj,
+			Token:     matched.Credential.Access,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("no valid token for account %s", matched.Credential.Email)
+}
+
+// GetAllAccounts returns a list of all stored account emails.
+func (a *AuthManager) GetAllAccounts() []string {
+	a.loadStoredCredential()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var emails []string
+	for _, acc := range a.store.GoogleAntigravity.Accounts {
+		if acc.Credential.Email != "" {
+			emails = append(emails, acc.Credential.Email)
+		}
+	}
+	return emails
+}
+

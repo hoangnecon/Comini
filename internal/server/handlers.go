@@ -299,7 +299,205 @@ func (h *Handlers) HandleQuota(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleWhamUsage serves /wham/usage and /backend-api/wham/usage for Codex Desktop & codex app-server native Quota UI.
+// WhamWindow represents a single sliding window rate-limit bucket in /wham/usage.
+type WhamWindow struct {
+	UsedPercent        int   `json:"used_percent"`
+	LimitWindowSeconds int   `json:"limit_window_seconds"`
+	ResetAfterSeconds  int   `json:"reset_after_seconds"`
+	ResetAt            int64 `json:"reset_at"`
+}
+
+// WhamRateLimit represents the rate limit block in /wham/usage.
+type WhamRateLimit struct {
+	Allowed         bool        `json:"allowed"`
+	LimitReached    bool        `json:"limit_reached"`
+	PrimaryWindow   *WhamWindow `json:"primary_window"`
+	SecondaryWindow *WhamWindow `json:"secondary_window"`
+}
+
+// WhamAdditionalLimit represents an additional per-model rate limit item.
+type WhamAdditionalLimit struct {
+	LimitName      string         `json:"limit_name"`
+	MeteredFeature string         `json:"metered_feature"`
+	RateLimit      *WhamRateLimit `json:"rate_limit"`
+}
+
+// WhamCredits represents the credits block.
+type WhamCredits struct {
+	HasCredits bool    `json:"has_credits"`
+	Unlimited  bool    `json:"unlimited"`
+	Balance    *string `json:"balance"`
+}
+
+// WhamUsageResponse represents the exact JSON schema required by Codex Desktop & app-server for /wham/usage and /api/codex/usage.
+type WhamUsageResponse struct {
+	AccountID            string                `json:"account_id"`
+	UserID               string                `json:"user_id"`
+	PlanType             string                `json:"plan_type"`
+	RateLimitName        *string               `json:"rate_limit_name"`
+	RateLimit            *WhamRateLimit        `json:"rate_limit"`
+	AdditionalRateLimits []WhamAdditionalLimit `json:"additional_rate_limits"`
+	Credits              WhamCredits           `json:"credits"`
+}
+
+// HandleWhamUsage serves /wham/usage and /api/codex/usage for Codex Desktop & codex app-server native Quota UI.
+func (h *Handlers) HandleWhamUsage(w http.ResponseWriter, r *http.Request) {
+	snap := h.getOrFetchQuotaSnapshot(r.Context())
+
+	// Read active ChatGPT account and user identifiers from ~/.codex/auth.json if present
+	accountID := "879af1e1-05b4-4b27-a9f8-906c13946419"
+	userID := "user-x959s7qOqk3uV6Aic5pUId0n"
+
+	home, _ := os.UserHomeDir()
+	authPath := filepath.Join(home, ".codex", "auth.json")
+	if raw, err := os.ReadFile(authPath); err == nil && len(raw) > 0 {
+		var authData struct {
+			Tokens struct {
+				AccountID string `json:"account_id"`
+			} `json:"tokens"`
+		}
+		if json.Unmarshal(raw, &authData) == nil && authData.Tokens.AccountID != "" {
+			accountID = authData.Tokens.AccountID
+		}
+	}
+
+	primaryWin := &WhamWindow{
+		UsedPercent:        snap.PrimaryUsedPercent,
+		LimitWindowSeconds: 18000,
+		ResetAfterSeconds:  snap.PrimaryResetAfterSec,
+		ResetAt:            snap.PrimaryResetAt,
+	}
+
+	secondaryWin := &WhamWindow{
+		UsedPercent:        snap.WeeklyUsedPercent,
+		LimitWindowSeconds: 604800,
+		ResetAfterSeconds:  snap.WeeklyResetAfterSec,
+		ResetAt:            snap.WeeklyResetAt,
+	}
+
+	rl := &WhamRateLimit{
+		Allowed:         snap.PrimaryUsedPercent < 100,
+		LimitReached:    snap.PrimaryUsedPercent >= 100,
+		PrimaryWindow:   primaryWin,
+		SecondaryWindow: secondaryWin,
+	}
+
+	knownModels := []string{
+		"google-antigravity/gemini-3.8-flash",
+		"google-antigravity/gemini-4-argon",
+		"google-antigravity/claude-sonnet-5-5",
+		"google-antigravity/claude-opus-5-5-thinking",
+		"google-antigravity/gpt-oss-120b-medium",
+		"gemini-3.8-flash",
+		"gemini-4-argon",
+	}
+
+	additional := make([]WhamAdditionalLimit, 0, len(knownModels))
+	for _, m := range knownModels {
+		additional = append(additional, WhamAdditionalLimit{
+			LimitName:      m,
+			MeteredFeature: "codex",
+			RateLimit:      rl,
+		})
+	}
+
+	resp := WhamUsageResponse{
+		AccountID:            accountID,
+		UserID:               userID,
+		PlanType:             "pro",
+		RateLimitName:        nil,
+		RateLimit:            rl,
+		AdditionalRateLimits: additional,
+		Credits: WhamCredits{
+			HasCredits: false,
+			Unlimited:  false,
+			Balance:    nil,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleRateLimitResetCredits serves available reset credit status for /api/codex/rate-limit-reset-credits.
+func (h *Handlers) HandleRateLimitResetCredits(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"available_count": 0,
+		"credits":         []any{},
+	})
+}
+
+// HandlePsMcp handles MCP JSON-RPC requests for the remote plugin service.
+func (h *Handlers) HandlePsMcp(w http.ResponseWriter, r *http.Request) {
+	var rpcReq struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      any    `json:"id"`
+		Method  string `json:"method"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&rpcReq)
+
+	// JSON-RPC notifications do not have an ID and must not receive a JSON-RPC response message
+	if rpcReq.ID == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	switch rpcReq.Method {
+	case "initialize":
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      rpcReq.ID,
+			"result": map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "comini-ps", "version": "1.0"},
+			},
+		})
+	case "tools/list":
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      rpcReq.ID,
+			"result": map[string]any{
+				"tools": []any{},
+			},
+		})
+	default:
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      rpcReq.ID,
+			"result":  map[string]any{},
+		})
+	}
+}
+
+// HandleAnalyticsEvents absorbs telemetry quietly.
+func (h *Handlers) HandleAnalyticsEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// HandleEmptyArray returns an empty JSON array.
+func (h *Handlers) HandleEmptyArray(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`[]`))
+}
+
+// HandleEmptyObject returns an empty JSON object.
+func (h *Handlers) HandleEmptyObject(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{}`))
+}
+
+
 
 // HandleResponses processes incoming Responses API requests from Codex Desktop.
 func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
