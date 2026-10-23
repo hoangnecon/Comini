@@ -1884,14 +1884,14 @@ func normalizeThoughtDelta(text string, atPartStart bool) string {
 	return text
 }
 
-// extractReasoningHeadline extracts a concise bold heading (max ~6 words, up to 45 chars)
-// from the opening of a reasoning block, suitable for Codex Desktop's title header bar.
+// extractReasoningHeadline extracts the natural opening headline or first sentence
+// from a reasoning block without artificial word-count or character-length truncation.
 func extractReasoningHeadline(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "Thinking"
 	}
-	// 1. If text already starts with markdown bold "**Headline**", extract it
+	// 1. If text already starts with markdown bold "**Headline**", extract it naturally
 	if strings.HasPrefix(text, "**") {
 		rest := text[2:]
 		if idx := strings.Index(rest, "**"); idx > 0 {
@@ -1902,44 +1902,30 @@ func extractReasoningHeadline(text string) string {
 		}
 	}
 
-	// 2. Extract from first sentence/clause
+	// 2. Extract natural first line
 	firstSeg := text
-	for _, delim := range []string{"\n", ".", "!", "?", ":", ";"} {
+	if idx := strings.Index(firstSeg, "\n"); idx != -1 {
+		firstSeg = firstSeg[:idx]
+	}
+	firstSeg = strings.TrimSpace(firstSeg)
+	if firstSeg == "" {
+		return "Thinking"
+	}
+
+	// 3. If there is a sentence boundary, take the first complete sentence
+	for _, delim := range []string{". ", "! ", "? "} {
 		if idx := strings.Index(firstSeg, delim); idx != -1 {
-			firstSeg = firstSeg[:idx]
+			firstSeg = firstSeg[:idx+1]
+			break
 		}
 	}
-	// Strip LaTeX math delimiters
-	firstSeg = strings.ReplaceAll(firstSeg, "$", "")
-	words := strings.Fields(firstSeg)
-	if len(words) == 0 {
+
+	firstSeg = strings.TrimSpace(firstSeg)
+	firstSeg = strings.TrimRight(firstSeg, ",;:\"'`")
+	if len(firstSeg) < 3 {
 		return "Thinking"
 	}
-	if len(words) > 6 {
-		words = words[:6]
-	}
-
-	// Trim trailing English stop words so headline does not end on "regarding the", etc.
-	stopWords := map[string]bool{
-		"the": true, "a": true, "an": true, "of": true, "to": true, "in": true,
-		"for": true, "on": true, "with": true, "at": true, "by": true, "from": true,
-		"up": true, "about": true, "into": true, "over": true, "after": true,
-		"regarding": true, "concerning": true, "and": true, "or": true, "but": true,
-		"is": true, "are": true, "was": true, "were": true,
-	}
-	for len(words) > 2 && stopWords[strings.ToLower(words[len(words)-1])] {
-		words = words[:len(words)-1]
-	}
-
-	headline := strings.Join(words, " ")
-	headline = strings.TrimRight(headline, ",;:\"'`.")
-	if len(headline) > 45 {
-		headline = strings.TrimSpace(headline[:42]) + "..."
-	}
-	if len(headline) < 3 {
-		return "Thinking"
-	}
-	runes := []rune(headline)
+	runes := []rune(firstSeg)
 	runes[0] = unicode.ToUpper(runes[0])
 	return string(runes)
 }

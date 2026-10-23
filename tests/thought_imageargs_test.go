@@ -67,8 +67,8 @@ data: {"candidates":[{"content":{"parts":[{"text":"Done."}]}}]}
 	}
 	res := out.String()
 
-	if !strings.Contains(res, `"delta":"**Initial verification is needed**"`) {
-		t.Fatalf("summary delta must be concise bold headline:\n%s", res)
+	if !strings.Contains(res, `"delta":"**Initial verification is needed regarding the precise Kakeya conjecture status in R^3.**"`) {
+		t.Fatalf("summary delta must be natural headline:\n%s", res)
 	}
 	// Content part should carry raw reasoning text
 	if !strings.Contains(res, `"delta":"Initial verification is needed regarding the precise Kakeya conjecture status in R^3. Requires careful review of literature."`) {
