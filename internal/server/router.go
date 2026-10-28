@@ -28,6 +28,24 @@ func NewRouter(h *Handlers) http.Handler {
 	mux.HandleFunc("/responses", h.HandleResponses)
 	mux.HandleFunc("/v1/responses", h.HandleResponses)
 
+	// Native Plugin Service & Asset Routes
+	mux.HandleFunc("/plugins/assets/", h.HandlePluginAssets)
+	mux.HandleFunc("/ps/plugins/home", h.HandlePsPluginsHome)
+	mux.HandleFunc("/ps/plugins/installed", h.HandlePsPluginsInstalled)
+	mux.HandleFunc("/ps/plugin-categories/", h.HandlePsPluginCategories)
+	mux.HandleFunc("/ps/plugins/search", h.HandlePsPluginsSearch)
+	mux.HandleFunc("/ps/plugins/list", h.HandlePsPluginsList)
+	mux.HandleFunc("/ps/plugins/batch", h.HandlePsPluginsBatch)
+	mux.HandleFunc("/ps/apps/batch", h.HandlePsAppsBatch)
+	mux.HandleFunc("/ps/plugins/canonical-app/", h.HandlePsCanonicalApp)
+	mux.HandleFunc("/ps/plugins/suggested/codex", h.HandlePsPluginsSuggested)
+	mux.HandleFunc("/ps/plugins/workspace/created", h.HandlePsWorkspacePlugins)
+	mux.HandleFunc("/ps/plugins/workspace/shared", h.HandlePsWorkspacePlugins)
+	mux.HandleFunc("/ps/event-subscriptions/batch", h.HandlePsEventSubscriptions)
+	mux.HandleFunc("/ps/plugins/", h.HandlePsPluginSubroutes)
+	mux.HandleFunc("/ps/mcp", h.HandlePsMcp)
+	mux.HandleFunc("/api/codex/ps/mcp", h.HandlePsMcp)
+
 	mux.HandleFunc("/", h.HandleFallbackJSON)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

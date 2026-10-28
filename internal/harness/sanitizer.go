@@ -21,6 +21,7 @@ var (
 const (
 	neutralIdentity          = "You are an expert AI software engineering assistant."
 	googleBrevityInstruction = "Output style for this session:\n- While you are still working (between tool calls), keep any text you emit to a single short line; do not narrate at length.\n- Do detailed reasoning internally, not as visible intermediate output.\n- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.\n- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires."
+	katexRenderingGuidance   = "KaTeX rendering environment contract:\n- Single-dollar inline math is disabled in client UI (`singleDollarTextMath: false`). NEVER use single dollar `$formula$` for math; single dollars are treated as plain text. Always use `\\(...\\)` or inline `$$formula$$` (e.g. `\\(C_{\\mathrm{in}}\\)` or `$$C_{\\mathrm{in}}$$`).\n- Display / block math must be placed on its own isolated lines with blank lines before and after, using `\\[...\\]` or `$$\\n...\\n$$`.\n- Inside math delimiters, never include markdown formatting (such as `**`, `*`, or bullet lists `1.`). Wrap textual labels or words in `\\text{...}` or `\\mathrm{...}` (e.g. `\\mathrm{fine}`, `\\text{coarse}`).\n- Never let math delimiters cross paragraphs or list items. Close delimiters cleanly before writing prose.\n- Escape literal dollar signs as `\\$` (e.g. `\\$100`) or wrap shell variables in backticks (`$PATH`, `$HOME`)."
 )
 
 // SanitizeMessageText cleans model_switch blocks and leaks from historical message text.
@@ -79,6 +80,10 @@ func SanitizeSystemInstruction(instructions *string, toolNames []string) *string
 	nudge := BuildToolCatalogNudge(toolNames)
 	if nudge != "" {
 		parts = append(parts, nudge)
+	}
+
+	if !strings.Contains(cleaned, "singleDollarTextMath") && !strings.Contains(cleaned, "KaTeX") {
+		parts = append(parts, katexRenderingGuidance)
 	}
 
 	if len(parts) == 0 {

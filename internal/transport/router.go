@@ -147,13 +147,13 @@ func ResolveModelAndEffort(modelID string, effort string) ResolvedModel {
 		return applyAGY2ModelDetails("gemini-3.1-flash-image", thinkingLevel)
 	}
 
-	// 7. Gemini 3.7 Flash models
+	// 7. Gemini 3.7 Flash models (Google CCA migrated 3.7 to 3.8 Flash; 3.7 returns 404 upstream)
 	if strings.Contains(m, "3.7") {
 		tier := "high"
 		if e == "low" || e == "medium" {
 			tier = e
 		}
-		return applyAGY2ModelDetails("gemini-3.7-flash-"+tier, thinkingLevel)
+		return applyAGY2ModelDetails("gemini-3.8-flash-"+tier, thinkingLevel)
 	}
 
 	// 8. Default Flash models (all general flash requests map to Gemini 3.8 Flash)

@@ -779,7 +779,7 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Send to CCA with auto-refresh on 401 Unauthenticated and fallback on 429 Resource Exhausted
+	// 7. Send to CCA with auto-refresh on 401 Unauthenticated and fallback on 404/429
 	resp, err := h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
 	if err != nil && h.authMgr != nil && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED")) {
 		log.Printf("[Comini Auth] 🔄 Upstream returned 401. Triggering ForceRefresh and retrying...")
@@ -789,6 +789,14 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				projectID = freshProj
 			}
 			authHeader = "Bearer " + freshToken
+			resp, err = h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
+		}
+	}
+	if err != nil && (strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NOT_FOUND")) {
+		if resolved.WireModelID != "gemini-3.8-flash-high" {
+			log.Printf("[Comini Fallback] ⚠️ Model %s returned 404 Not Found from upstream CCA. Retrying with universally available gemini-3.8-flash-high...", resolved.WireModelID)
+			fallbackWire := "gemini-3.8-flash-high"
+			resolved = transport.ResolveModelAndEffort(fallbackWire, "high")
 			resp, err = h.ccaClient.StreamGenerateContent(r.Context(), resolved.WireModelID, wireBody, authHeader, projectID)
 		}
 	}
