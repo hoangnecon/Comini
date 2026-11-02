@@ -151,6 +151,9 @@ func MapGeminiStreamToResponses(
 	loopCount := 0
 
 	var inputTokens, outputTokens, reasoningTokens, cachedTokens int
+	var lastFinishReason string
+	var currentTurnMessage strings.Builder
+	var currentTurnToolCalls int
 
 	// Upstream timing diagnostics (logged at the end): lets us measure, from comini.log alone,
 	// whether a "frozen" UI was upstream silence (e.g. a large tool call or hidden reasoning).
@@ -211,7 +214,7 @@ func MapGeminiStreamToResponses(
 		if len(thoughtText) < 2 {
 			return
 		}
-		comID := randomID("msg")
+		comID := randomID("msg_thought")
 		idx := outputIndex
 		outputIndex++
 
@@ -675,6 +678,9 @@ scanLoop:
 		}
 
 		for _, cand := range candidates {
+			if cand.FinishReason != "" {
+				lastFinishReason = cand.FinishReason
+			}
 			for _, part := range cand.Content.Parts {
 				// Record thought signature
 				if part.ThoughtSignature != "" {
@@ -747,6 +753,7 @@ scanLoop:
 					}
 
 					accumulatedMessage.WriteString(textDelta)
+					currentTurnMessage.WriteString(textDelta)
 
 					emitSSE("response.output_text.delta", map[string]any{
 						"output_index":  messageIndex,
@@ -763,6 +770,7 @@ scanLoop:
 
 				// C. Function / Tool Call Part
 				if part.FunctionCall != nil {
+					currentTurnToolCalls++
 					if lastGap >= 5*time.Second {
 						argBytes := 0
 						if b, err := json.Marshal(part.FunctionCall.Args); err == nil {
@@ -1061,6 +1069,9 @@ scanLoop:
 						// Server-side Autonomous Loop: Continue with Gemini if ContinueFn is provided (unlimited loops)
 						if streamOpts.ContinueFn != nil {
 							loopCount++
+							lastFinishReason = ""
+							currentTurnMessage.Reset()
+							currentTurnToolCalls = 0
 							obsText := fmt.Sprintf("[Observation: tool image_generation succeeded -> saved to: %s. To display this image to the user, include Markdown embed ![%s](%s) in your message]", savedPath, prompt, savedPath)
 							if genErr != nil {
 								obsText = fmt.Sprintf("[Observation: tool image_generation failed with error: %v]", genErr)
@@ -1391,7 +1402,30 @@ scanLoop:
 		outputTokens = 1
 	}
 
+	// Detect mid-sentence / premature upstream stream termination:
+	// If Gemini closed the SSE stream with no tool call in this turn, and either:
+	//   1) finishReason is non-STOP (e.g. MALFORMED_FUNCTION_CALL, OTHER, RECITATION), OR
+	//   2) the model emitted a short incomplete sentence that does not end with terminal punctuation
+	//      ('.', '!', '?', ':', '`', '"', '\'', ')', ']', '}', '*'),
+	// automatically resume via ContinueFn so the workflow never stops mid-sentence.
+	turnMsgTrimmed := strings.TrimSpace(currentTurnMessage.String())
+	isMidSentenceStop := false
+	if currentTurnToolCalls == 0 && len(turnMsgTrimmed) > 0 && len(turnMsgTrimmed) < 600 {
+		lastRune := rune(turnMsgTrimmed[len(turnMsgTrimmed)-1])
+		for _, r := range turnMsgTrimmed {
+			lastRune = r
+		}
+		switch lastRune {
+		case '.', '!', '?', ':', ';', '`', '"', '\'', ')', ']', '}', '*', '…', '—', '-':
+			isMidSentenceStop = false
+		default:
+			isMidSentenceStop = true
+		}
+	}
+	isAbnormalFinish := currentTurnToolCalls == 0 && lastFinishReason != "" && lastFinishReason != "STOP"
+
 	// Safety net: if no actionable items (no final_answer message, no tool call) were emitted,
+	// OR if the model stream aborted mid-sentence / with MALFORMED_FUNCTION_CALL before emitting its tool call,
 	// first try continuing via ContinueFn so Gemini emits its next tool call or final response.
 	hasActionableItem := false
 	for _, it := range completedOutputItems {
@@ -1403,15 +1437,24 @@ scanLoop:
 		}
 	}
 
-	if !hasActionableItem && streamOpts.ContinueFn != nil && loopCount < 2 && writeErr == nil {
+	if (!hasActionableItem || isMidSentenceStop || isAbnormalFinish) && streamOpts.ContinueFn != nil && loopCount < 2 && writeErr == nil {
 		loopCount++
+		log.Printf("[Comini Auto-Resume] 🔄 Stream ended prematurely (finishReason=%q, midSentence=%v, turnMsgLen=%d). Continuing via ContinueFn (attempt %d/2)...",
+			lastFinishReason, isMidSentenceStop, len(turnMsgTrimmed), loopCount)
 		callCtx := streamOpts.Context
 		if callCtx == nil {
 			callCtx = context.Background()
 		}
+		modelEchoText := turnMsgTrimmed
+		if modelEchoText == "" {
+			modelEchoText = "..."
+		}
+		lastFinishReason = ""
+		currentTurnMessage.Reset()
+		currentTurnToolCalls = 0
 		newReader, cErr := streamOpts.ContinueFn(callCtx, domain.GeminiPart{
-			Text: "...",
-		}, "[Observation: Your previous turn produced no tool call or final output. Please immediately invoke the next tool or output your response to complete the user's request.]")
+			Text: modelEchoText,
+		}, "[Observation: Your previous output was cut off mid-sentence before invoking any tool. Please immediately invoke the required tool call (e.g.mcp__flow__flow_generate, exec_command, apply_patch) or complete your response.]")
 		if cErr == nil && newReader != nil {
 			if curCloser, ok := currentReader.(io.Closer); ok {
 				_ = curCloser.Close()
