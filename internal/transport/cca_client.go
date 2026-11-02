@@ -206,6 +206,21 @@ func (c *CCAClient) StreamGenerateContent(
 		}
 
 		log.Printf("[CCA Error] ❌ HTTP %d: %s | payloadBytes=%d", resp.StatusCode, string(bodyBytes), len(payloadBytes))
+		if resp.StatusCode == http.StatusBadRequest {
+			dumpRejectedPayload(payloadBytes, bodyBytes)
+			// A byte-identical payload that CCA rejected with the generic message below was observed to be
+			// accepted on replay (2026-10-29), i.e. it can be a transient server-side rejection. Retry once.
+			// Specific 400s (e.g. "Corrupted thought signature") are deterministic and are never retried.
+			if attempt == 0 && strings.Contains(string(bodyBytes), "Request contains an invalid argument") {
+				log.Printf("[CCA Warning] ⚠️ Generic HTTP 400 INVALID_ARGUMENT; retrying the identical payload once")
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(700 * time.Millisecond):
+				}
+				continue
+			}
+		}
 		return nil, lastErr
 	}
 
@@ -665,4 +680,32 @@ func imageBlockReason(root map[string]any) string {
 		return " (blockReason=" + br + ")"
 	}
 	return ""
+}
+
+// dumpRejectedPayload saves the exact wire body and upstream response of an HTTP 400 so the
+// rejection can be replayed offline. Files are written to ~/.codex/comini_failed/ (last 5 kept).
+func dumpRejectedPayload(payload, response []byte) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".codex", "comini_failed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	stamp := time.Now().Format("20060102-150405")
+	reqPath := filepath.Join(dir, stamp+"-request.json")
+	if err := os.WriteFile(reqPath, payload, 0o600); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, stamp+"-response.json"), response, 0o600)
+	log.Printf("[CCA Error] 💾 Rejected wire body saved: %s", reqPath)
+
+	matches, _ := filepath.Glob(filepath.Join(dir, "*-request.json"))
+	if len(matches) > 5 {
+		for _, m := range matches[:len(matches)-5] {
+			_ = os.Remove(m)
+			_ = os.Remove(strings.TrimSuffix(m, "-request.json") + "-response.json")
+		}
+	}
 }

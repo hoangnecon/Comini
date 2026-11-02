@@ -70,7 +70,10 @@ type InputItem struct {
 	Goal             string           `json:"goal,omitempty"`
 	Summary          json.RawMessage  `json:"summary,omitempty"`
 	RevisedPrompt    string           `json:"revised_prompt,omitempty"`
-	Result           string           `json:"result,omitempty"`
+	Result           string           `json:"-"`
+	RawResult        json.RawMessage  `json:"-"`
+	Error            string           `json:"-"`
+	RawError         json.RawMessage  `json:"-"`
 	SavedPath        string           `json:"saved_path,omitempty"`
 	Prompt           string           `json:"prompt,omitempty"`
 	Status           string           `json:"status,omitempty"`
@@ -95,6 +98,8 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 		AltAspectRatio      string          `json:"aspectRatio"`
 		RawArgs             json.RawMessage `json:"arguments"`
 		RawInput            json.RawMessage `json:"input"`
+		RawResult           json.RawMessage `json:"result"`
+		RawError            json.RawMessage `json:"error"`
 	}{
 		Alias: (*Alias)(i),
 	}
@@ -142,6 +147,35 @@ func (i *InputItem) UnmarshalJSON(data []byte) error {
 			i.Input = s
 		} else {
 			i.Input = string(aux.RawInput)
+		}
+	}
+	if len(aux.RawResult) > 0 && string(aux.RawResult) != "null" {
+		i.RawResult = aux.RawResult
+		var s string
+		if err := json.Unmarshal(aux.RawResult, &s); err == nil {
+			i.Result = s
+		}
+		if len(i.Output) == 0 {
+			i.Output = aux.RawResult
+		}
+	}
+	if len(aux.RawError) > 0 && string(aux.RawError) != "null" {
+		i.RawError = aux.RawError
+		var s string
+		if err := json.Unmarshal(aux.RawError, &s); err == nil {
+			i.Error = s
+		} else {
+			var errObj struct {
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(aux.RawError, &errObj); err == nil && errObj.Message != "" {
+				i.Error = errObj.Message
+			} else {
+				i.Error = string(aux.RawError)
+			}
+		}
+		if i.Failure == "" {
+			i.Failure = i.Error
 		}
 	}
 

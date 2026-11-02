@@ -1533,6 +1533,9 @@ scanLoop:
 	if inputTokens > 0 {
 		hitRate = float64(cachedTokens) / float64(inputTokens) * 100
 	}
+	if store != nil && sessionID != "" && inputTokens > 0 {
+		store.SetSessionTokenUsage(sessionID, inputTokens, cachedTokens, outputTokens)
+	}
 	log.Printf("[Comini] 📊 Tokens: input=%d (cached=%d, hit=%.1f%%) output=%d reasoning=%d",
 		inputTokens, cachedTokens, hitRate, outputTokens, reasoningTokens)
 	log.Printf("[Comini Stream] ⏱ upstream chunks=%d firstChunk=%.1fs maxGap=%.1fs total=%.1fs",

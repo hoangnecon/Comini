@@ -26,12 +26,22 @@ type imageCallEntry struct {
 	Timestamp time.Time      `json:"ts"`
 }
 
+// sessionTokenUsage tracks the server-reported token counts from the previous turn,
+// matching Antigravity 2.0's TrajectoryChatConverter.modelReportedPrefixTokens (0x101610c20).
+type sessionTokenUsage struct {
+	PromptTokens int       `json:"prompt_tokens"`
+	CachedTokens int       `json:"cached_tokens"`
+	OutputTokens int       `json:"output_tokens"`
+	Timestamp    time.Time `json:"ts"`
+}
+
 type persistedStoreData struct {
 	ImageCalls     map[string]imageCallEntry          `json:"image_calls,omitempty"`
 	Calls          map[string]callEntry               `json:"calls"`
 	BySessionCall  map[string]string                  `json:"by_session_call"`
 	SessionCutoffs map[string]int                     `json:"session_cutoffs,omitempty"`
 	SessionTools   map[string][]domain.ToolDefinition `json:"session_tools,omitempty"`
+	SessionTokens  map[string]sessionTokenUsage       `json:"session_tokens,omitempty"`
 }
 
 type SignatureStore struct {
@@ -40,6 +50,7 @@ type SignatureStore struct {
 	bySessionCall  map[string]string
 	sessionCutoffs map[string]int
 	sessionTools   map[string][]domain.ToolDefinition
+	sessionTokens  map[string]sessionTokenUsage
 	imageCalls     map[string]imageCallEntry
 	filePath       string
 	ttl            time.Duration
@@ -64,12 +75,28 @@ func NewSignatureStore(ttl time.Duration) *SignatureStore {
 		bySessionCall:  make(map[string]string),
 		sessionCutoffs: make(map[string]int),
 		sessionTools:   make(map[string][]domain.ToolDefinition),
+		sessionTokens:  make(map[string]sessionTokenUsage),
 		imageCalls:     make(map[string]imageCallEntry),
 		filePath:       filePath,
 		ttl:            ttl,
 	}
 	s.load()
 	return s
+}
+
+// NewMemorySignatureStore creates an in-memory SignatureStore that never touches disk.
+// Ideal for unit and regression tests to guarantee tests never overwrite ~/.codex/comini_signatures.json.
+func NewMemorySignatureStore(ttl time.Duration) *SignatureStore {
+	return &SignatureStore{
+		calls:          make(map[string]callEntry),
+		bySessionCall:  make(map[string]string),
+		sessionCutoffs: make(map[string]int),
+		sessionTools:   make(map[string][]domain.ToolDefinition),
+		sessionTokens:  make(map[string]sessionTokenUsage),
+		imageCalls:     make(map[string]imageCallEntry),
+		filePath:       "",
+		ttl:            ttl,
+	}
 }
 
 func (s *SignatureStore) pruneExpiredLocked() {
@@ -108,6 +135,12 @@ func (s *SignatureStore) pruneExpiredLocked() {
 	}
 	if len(s.sessionTools) > 500 {
 		s.sessionTools = make(map[string][]domain.ToolDefinition)
+	}
+	if s.sessionTokens == nil {
+		s.sessionTokens = make(map[string]sessionTokenUsage)
+	}
+	if len(s.sessionTokens) > 2000 {
+		s.sessionTokens = make(map[string]sessionTokenUsage)
 	}
 	for id, entry := range s.imageCalls {
 		if now.Sub(entry.Timestamp) > s.ttl {
@@ -172,6 +205,9 @@ func (s *SignatureStore) load() {
 		if p.SessionTools != nil {
 			s.sessionTools = p.SessionTools
 		}
+		if p.SessionTokens != nil {
+			s.sessionTokens = p.SessionTokens
+		}
 		if p.ImageCalls != nil {
 			s.imageCalls = p.ImageCalls
 		}
@@ -189,6 +225,7 @@ func (s *SignatureStore) saveLocked() {
 		BySessionCall:  s.bySessionCall,
 		SessionCutoffs: s.sessionCutoffs,
 		SessionTools:   s.sessionTools,
+		SessionTokens:  s.sessionTokens,
 		ImageCalls:     s.imageCalls,
 	}
 	data, err := json.Marshal(p)
@@ -388,6 +425,40 @@ func (s *SignatureStore) GetSessionTools(sessionID string) []domain.ToolDefiniti
 	return out
 }
 
+// SetSessionTokenUsage records the server-reported usageMetadata from the latest Gemini turn
+// (matching Antigravity 2.0's TrajectoryChatConverter.modelReportedPrefixTokens at 0x101610c20).
+func (s *SignatureStore) SetSessionTokenUsage(sessionID string, promptTokens, cachedTokens, outputTokens int) {
+	if s == nil || sessionID == "" || promptTokens <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionTokens == nil {
+		s.sessionTokens = make(map[string]sessionTokenUsage)
+	}
+	s.sessionTokens[sessionID] = sessionTokenUsage{
+		PromptTokens: promptTokens,
+		CachedTokens: cachedTokens,
+		OutputTokens: outputTokens,
+		Timestamp:    time.Now(),
+	}
+	s.saveLocked()
+}
+
+// GetSessionTokenUsage returns the last server-reported token counts for a session.
+func (s *SignatureStore) GetSessionTokenUsage(sessionID string) (promptTokens, cachedTokens, outputTokens int, ok bool) {
+	if s == nil || sessionID == "" {
+		return 0, 0, 0, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, found := s.sessionTokens[sessionID]
+	if !found || u.PromptTokens <= 0 {
+		return 0, 0, 0, false
+	}
+	return u.PromptTokens, u.CachedTokens, u.OutputTokens, true
+}
+
 func (s *SignatureStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,6 +466,7 @@ func (s *SignatureStore) Clear() {
 	s.bySessionCall = make(map[string]string)
 	s.sessionCutoffs = make(map[string]int)
 	s.sessionTools = make(map[string][]domain.ToolDefinition)
+	s.sessionTokens = make(map[string]sessionTokenUsage)
 	s.imageCalls = make(map[string]imageCallEntry)
 	s.saveLocked()
 

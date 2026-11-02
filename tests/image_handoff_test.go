@@ -134,9 +134,8 @@ func TestStreamEmitsKeepaliveWhileUpstreamIsSilent(t *testing.T) {
 	}
 }
 
-// Evicting oldest images one at a time rewrote early history on every new image and dropped the
-// KV prefix cache each turn. Eviction must now move in batches: between boundaries the set of
-// evicted images is identical, so the prompt prefix is byte-stable.
+// Antigravity 2.0 never evicts or rewrites historical InlineData images into text placeholders
+// mid-session, keeping 100% of the prompt prefix byte-stable across all image additions.
 func TestEvictStaleImagesIsBatched(t *testing.T) {
 	build := func(n int) []int {
 		store := session.NewSignatureStore(time.Hour)
@@ -167,18 +166,10 @@ func TestEvictStaleImagesIsBatched(t *testing.T) {
 		return evicted
 	}
 
-	base := build(17)
-	if len(base) != 8 {
-		t.Fatalf("17 images: expected one batch of 8 evicted, got %v", base)
-	}
-	for n := 18; n <= 24; n++ {
-		got := build(n)
-		if fmt.Sprint(got) != fmt.Sprint(base) {
-			t.Fatalf("%d images: evicted set changed inside a batch (%v vs %v) -> prefix cache would break", n, got, base)
+	for n := 17; n <= 25; n++ {
+		if got := build(n); len(got) != 0 {
+			t.Fatalf("%d images: expected 0 evicted images (100%% prefix stability), got %v", n, got)
 		}
-	}
-	if got := build(25); len(got) != 16 {
-		t.Fatalf("25 images: expected next batch (16 evicted), got %v", got)
 	}
 }
 

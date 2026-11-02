@@ -31,3 +31,18 @@ func TestUnmarshalCCAResponse(t *testing.T) {
 		t.Fatalf("expected text=red, got %q", parts[0].Text)
 	}
 }
+
+func TestUnmarshalInputItemMCPResult(t *testing.T) {
+	raw := `[
+		{"type":"userMessage","text":"Hello 1"},
+		{"type":"mcpToolCall","id":"call_eac13629efc8","server":"golab","tool":"run_code_cell","status":"completed","arguments":{"cellId":"jmIUm3Qhr3MR"},"result":{"content":[{"type":"text","text":"started"}]}},
+		{"type":"userMessage","text":"Hello 2"}
+	]`
+	var items []domain.InputItem
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+}

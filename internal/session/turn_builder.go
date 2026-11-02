@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
 	"os"
 	"strconv"
+	"sync"
 
 	"sort"
 	"strings"
@@ -394,6 +396,9 @@ func extractInlineDataFromMap(m map[string]any) ([]*domain.GeminiInlineData, map
 		default:
 			cleanMap[k] = v
 		}
+		if strVal, ok := cleanMap[k].(string); ok && len(strVal) > 32000 {
+			cleanMap[k] = deterministicCapText(strVal, 32000, 20000, 6000, "tool output field truncated")
+		}
 	}
 
 	if b64, ok := m["data"].(string); ok && len(b64) > 50 {
@@ -471,6 +476,9 @@ func extractImagesAndCleanOutput(rawOutput json.RawMessage) ([]*domain.GeminiInl
 			return extractImagesAndCleanOutput([]byte(trimmed))
 		}
 		imgs, cleaned := extractInlineDataFromText(strOut)
+		if len(cleaned) > 32000 {
+			cleaned = deterministicCapText(cleaned, 32000, 20000, 6000, "tool output truncated")
+		}
 		cleanMap := map[string]any{"result": cleaned}
 		if len(imgs) > 0 {
 			cleanMap["image_status"] = "Image loaded into vision encoder"
@@ -480,6 +488,9 @@ func extractImagesAndCleanOutput(rawOutput json.RawMessage) ([]*domain.GeminiInl
 
 	rawStr := string(rawOutput)
 	imgs, cleaned := extractInlineDataFromText(rawStr)
+	if len(cleaned) > 32000 {
+		cleaned = deterministicCapText(cleaned, 32000, 20000, 6000, "tool output truncated")
+	}
 	cleanMap := map[string]any{"result": cleaned}
 	if len(imgs) > 0 {
 		cleanMap["image_status"] = "Image loaded into vision encoder"
@@ -662,12 +673,23 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 		curr := &cleanContents[i]
 
 		if curr.Role == "model" {
+			var nextUserResponses map[string]bool
+			if i+1 < len(cleanContents) && cleanContents[i+1].Role == "user" {
+				nextUserResponses = make(map[string]bool)
+				for _, p := range cleanContents[i+1].Parts {
+					if p.FunctionResponse != nil && p.FunctionResponse.Name != "" {
+						nextUserResponses[p.FunctionResponse.Name] = true
+					}
+				}
+			}
+
 			for pi := range curr.Parts {
 				p := &curr.Parts[pi]
 				if p.FunctionCall != nil {
-					// Cloud Code Assist strictly requires thoughtSignature on FunctionCall parts.
-					// If missing or name is empty, downgrade to plain text action to avoid HTTP 400.
-					if p.FunctionCall.Name == "" || p.ThoughtSignature == "" {
+					// Cloud Code Assist strictly requires thoughtSignature on FunctionCall parts,
+					// AND requires that the immediately following user turn contains the matching FunctionResponse.
+					// If missing, downgrade to plain text action to avoid HTTP 400 INVALID_ARGUMENT.
+					if p.FunctionCall.Name == "" || p.ThoughtSignature == "" || nextUserResponses == nil || !nextUserResponses[p.FunctionCall.Name] {
 						var argsStr string
 						if p.FunctionCall.Args != nil {
 							b, _ := json.Marshal(p.FunctionCall.Args)
@@ -721,48 +743,169 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 	return mergeConsecutiveRoles(cleanContents)
 }
 
-func compressOversizedImage(in *domain.GeminiInlineData) *domain.GeminiInlineData {
-	if in == nil || len(in.Data) <= 600000 { // ~450KB binary is already well-sized
-		return in
+// AGY 2.0 disassembled vision pipeline constants (__DATA 0x1083e1080, CompressMedia at 0x100ba5800):
+//   - maxEncodedBytes = 5,242,880 (0x500000 = 5 MiB)
+//   - maxSide         = 2576      (0xa10 = 2576 px)
+//   - jpegQuality     = 85        (0x55)
+const (
+	agyMaxEncodedImageBytes = 5 * 1024 * 1024 // 5 MiB raw bytes
+	agyMaxImageSide         = 2576
+	agyJPEGQuality          = 85
+)
+
+type cachedMediaResult struct {
+	inlineData *domain.GeminiInlineData
+	tokens     int
+}
+
+var mediaProcessCache sync.Map // sha256(base64) -> cachedMediaResult
+
+func resizeImageNearest(src image.Image, newW, newH int) image.Image {
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if srcW <= 0 || srcH <= 0 || (srcW == newW && srcH == newH) {
+		return src
 	}
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	for y := 0; y < newH; y++ {
+		sy := b.Min.Y + (y*srcH)/newH
+		for x := 0; x < newW; x++ {
+			sx := b.Min.X + (x*srcW)/newW
+			dst.Set(x, y, src.At(sx, sy))
+		}
+	}
+	return dst
+}
+
+// resizeToMaxSide mirrors Antigravity 2.0's media.resizeToMaxSide (0x100ba5d10).
+func resizeToMaxSide(src image.Image, maxSide int) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 || (w <= maxSide && h <= maxSide) {
+		return src
+	}
+	newW, newH := w, h
+	if w >= h {
+		newW = maxSide
+		newH = (h * maxSide) / w
+	} else {
+		newH = maxSide
+		newW = (w * maxSide) / h
+	}
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
+	return resizeImageNearest(src, newW, newH)
+}
+
+// estimateMediaTokens mirrors Antigravity 2.0's disassembled media.GetMediaTokenCount (0x100ba5590):
+// tokens = max(1122, (width * height) / 750).
+func estimateMediaTokens(w, h int) int {
+	t := (w * h) / 750
+	if t < 1122 {
+		t = 1122
+	}
+	return t
+}
+
+// compressOversizedImage implements Antigravity 2.0's media.CompressMedia (0x100ba5800) with
+// content-addressed memoization so each image in the session is processed once and stays
+// 100% immutable across all subsequent turns.
+func compressOversizedImage(in *domain.GeminiInlineData) (*domain.GeminiInlineData, int) {
+	if in == nil || len(in.Data) == 0 {
+		return in, 1122
+	}
+	sum := sha256.Sum256([]byte(in.Data))
+	if cached, ok := mediaProcessCache.Load(sum); ok {
+		res := cached.(cachedMediaResult)
+		return res.inlineData, res.tokens
+	}
+
 	raw, err := base64.StdEncoding.DecodeString(in.Data)
 	if err != nil {
-		return in
+		return in, 1122
 	}
+
+	cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(raw))
+	w, h := 1024, 1024
+	if cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
+		w, h = cfg.Width, cfg.Height
+	}
+
+	// Fast path: matches AGY 2.0's CompressMedia check — if raw bytes <= maxEncodedBytes (5 MiB)
+	// and both dimensions <= maxSide (2576 px) and the wire base64 is already compact (<= 600KB),
+	// keep the original image bytes untouched.
+	if len(raw) <= agyMaxEncodedImageBytes && w <= agyMaxImageSide && h <= agyMaxImageSide && len(in.Data) <= 600000 {
+		tokens := estimateMediaTokens(w, h)
+		mediaProcessCache.Store(sum, cachedMediaResult{inlineData: in, tokens: tokens})
+		return in, tokens
+	}
+
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return in
+		tokens := estimateMediaTokens(w, h)
+		mediaProcessCache.Store(sum, cachedMediaResult{inlineData: in, tokens: tokens})
+		return in, tokens
 	}
+
+	// Step 1: Resize to maxSide (2576 px) preserving aspect ratio
+	img = resizeToMaxSide(img, agyMaxImageSide)
+	b := img.Bounds()
+	w, h = b.Dx(), b.Dy()
+
+	// Step 2: Encode as JPEG at quality 85, stepping down by 3/4 (down to floor 256 px)
+	// if encoded bytes still exceed agyMaxEncodedImageBytes.
 	var buf bytes.Buffer
-	err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75})
-	if err != nil {
-		return in
+	curImg := img
+	for {
+		buf.Reset()
+		if encErr := jpeg.Encode(&buf, curImg, &jpeg.Options{Quality: agyJPEGQuality}); encErr != nil {
+			tokens := estimateMediaTokens(w, h)
+			mediaProcessCache.Store(sum, cachedMediaResult{inlineData: in, tokens: tokens})
+			return in, tokens
+		}
+		if buf.Len() <= agyMaxEncodedImageBytes {
+			break
+		}
+		cb := curImg.Bounds()
+		maxDim := cb.Dx()
+		if cb.Dy() > maxDim {
+			maxDim = cb.Dy()
+		}
+		nextSide := (maxDim * 3) / 4
+		if nextSide < 256 {
+			break
+		}
+		curImg = resizeToMaxSide(curImg, nextSide)
+		w, h = curImg.Bounds().Dx(), curImg.Bounds().Dy()
 	}
+
 	newB64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+	out := in
 	if len(newB64) < len(in.Data) {
-		return &domain.GeminiInlineData{
+		out = &domain.GeminiInlineData{
 			MimeType: "image/jpeg",
 			Data:     newB64,
 		}
 	}
-	return in
+	tokens := estimateMediaTokens(w, h)
+	mediaProcessCache.Store(sum, cachedMediaResult{inlineData: out, tokens: tokens})
+	if out != in {
+		outSum := sha256.Sum256([]byte(out.Data))
+		mediaProcessCache.Store(outSum, cachedMediaResult{inlineData: out, tokens: tokens})
+	}
+	return out, tokens
 }
 
-// imageEvictionStep is the batch size used by evictStaleImages. Evicting oldest-first one image
-// at a time rewrote an early part of the prompt on every new image once the window was full,
-// which invalidated the whole KV prefix cache each turn (measured: cached 369,351 -> 10,084
-// tokens at the 17th image). Evicting in batches rewrites history only once per step.
-const imageEvictionStep = 8
-
-func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.GeminiContent {
-	// Total image payload budget across the request (compressOversizedImage keeps each image
-	// to roughly 60-90KB of base64) so wire payloads stay well under the upstream limit.
-	const maxTotalImageChars = 1600000
-
-	type imgRef struct{ ci, pi int }
-	var refs []imgRef // oldest -> newest
-	var sizes []int
-
+// normalizeAndCompressImages validates and compresses all inline images in place at creation/replay
+// without EVER mutating or evicting historical turns' InlineData into text placeholders.
+// In Antigravity 2.0, historical media parts remain 100% immutable in the prompt prefix until
+// a full trajectory checkpoint/compaction occurs, preventing retroactive KV-cache invalidation.
+func normalizeAndCompressImages(contents []domain.GeminiContent) ([]domain.GeminiContent, map[int]int) {
+	partTokens := make(map[int]int)
 	for ci := range contents {
 		for pi := range contents[ci].Parts {
 			p := &contents[ci].Parts[pi]
@@ -775,45 +918,12 @@ func evictStaleImages(contents []domain.GeminiContent, maxKeep int) []domain.Gem
 				p.InlineData = nil
 				continue
 			}
-			p.InlineData = compressOversizedImage(validData)
-			refs = append(refs, imgRef{ci, pi})
-			sizes = append(sizes, len(p.InlineData.Data))
+			compressed, tokens := compressOversizedImage(validData)
+			p.InlineData = compressed
+			partTokens[ci] += tokens
 		}
 	}
-
-	// Minimum number of oldest images that must go to satisfy the count and byte budgets.
-	need := 0
-	if len(refs) > maxKeep {
-		need = len(refs) - maxKeep
-	}
-	kept, total := 0, 0
-	for i := len(refs) - 1; i >= 0; i-- {
-		if kept < maxKeep && total+sizes[i] <= maxTotalImageChars {
-			kept++
-			total += sizes[i]
-			continue
-		}
-		if i+1 > need {
-			need = i + 1
-		}
-		break
-	}
-
-	// Round up to a whole batch: the evicted set only changes once every imageEvictionStep
-	// new images, so the prompt prefix stays byte-identical in between.
-	if need > 0 {
-		need = ((need + imageEvictionStep - 1) / imageEvictionStep) * imageEvictionStep
-		if need > len(refs) {
-			need = len(refs)
-		}
-	}
-
-	for i := 0; i < need; i++ {
-		p := &contents[refs[i].ci].Parts[refs[i].pi]
-		p.Text = fmt.Sprintf("[Image: %s previously inspected and processed in earlier turn]", p.InlineData.MimeType)
-		p.InlineData = nil
-	}
-	return contents
+	return contents, partTokens
 }
 
 func isSyntheticThoughtText(raw string) bool {
@@ -918,11 +1028,17 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 	contents = capAllPartsText(contents)
 	contents = sanitizeAndValidateGeminiContents(contents)
 
+	// Stage 1: Normalize and compress images in place using AGY 2.0's CompressMedia (2576px, JPEG Q85, 5MiB)
+	// and compute exact image token weights via GetMediaTokenCount: max(1122, (w*h)/750).
+	// Historical images are NEVER evicted or rewritten into text placeholders mid-session.
+	var turnImageTokens map[int]int
+	contents, turnImageTokens = normalizeAndCompressImages(contents)
+
 	// Measure textual/structural token weight independently of raw base64 image bytes.
-	// Gemini Vision bills images at fixed tile tokens (~258-1032 tokens ≈ 4,000 chars),
+	// Gemini Vision bills images at fixed tile tokens (~1122 tokens ≈ 4,488 chars),
 	// whereas counting raw base64 length (~250,000 chars) caused cutoffIndex to jump
-	// forward/backward by 40-80 turns whenever an image was added or evicted!
-	calcContentSize := func(c domain.GeminiContent) int {
+	// forward/backward by 40-80 turns whenever an image was added!
+	calcContentSizeAt := func(idx int, c domain.GeminiContent) int {
 		total := 0
 		for _, p := range c.Parts {
 			total += len(p.Text)
@@ -935,16 +1051,24 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 				total += len(b)
 			}
 			if p.InlineData != nil {
-				total += 4000
+				if imgToks, ok := turnImageTokens[idx]; ok && imgToks > 0 {
+					total += imgToks * 4
+				} else {
+					total += 4488 // 1122 tokens * 4 chars/token
+				}
 			}
 		}
 		return total
 	}
 
+	calcContentSize := func(c domain.GeminiContent) int {
+		return calcContentSizeAt(-1, c)
+	}
+
 	calcTotalSize := func(cts []domain.GeminiContent) int {
 		total := 0
-		for _, c := range cts {
-			total += calcContentSize(c)
+		for i, c := range cts {
+			total += calcContentSizeAt(i, c)
 		}
 		return total
 	}
@@ -953,10 +1077,6 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 	// Normal sessions auto-compact natively in Codex at auto_compact_token_limit = 1,000,000 tokens,
 	// keeping 100% of the prefix immutable across the full 1M context window.
 	const maxCharsBudget = 3800000
-
-	// Stage 1: Enforce image budget.
-	// Keep up to 16 compressed JPEG images (~1.6MB max) so earlier turns are not mutated mid-session.
-	contents = evictStaleImages(contents, 16)
 
 	// Check if this session already has a ratcheted cutoffIndex from an earlier compaction.
 	lastCutoff := 0
@@ -974,7 +1094,7 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 	}
 
 	// Fast path 1: If session already compacted at lastCutoff, keep cutoffIndex 100% locked
-	// at lastCutoff as long as the active window fits within maxCharsBudget (800,000 chars)!
+	// at lastCutoff as long as the active window fits within maxCharsBudget!
 	if hasCutoff {
 		first := contents[0]
 		preserved := extractPreservedUserTurns(contents, lastCutoff)
@@ -1638,6 +1758,49 @@ func BuildGeminiWireBodyWithItems(
 				currentParts = append(currentParts, domain.GeminiPart{
 					Text: fmt.Sprintf("[Action: called %s with %s]", sanitizedName, string(argsJSON)),
 				})
+			}
+
+			// If this item contains completed or failed execution results (Codex desktop inline tool execution pattern):
+			// Only UI-projected inline-execution items carry their result on the call itself.
+			// Responses-API items (function_call, custom_tool_call, ...) always get a separate
+			// *_output item, so emitting a response here would duplicate it (HTTP 400).
+			inlineResult := normType == "mcptoolcall" || normType == "dynamictoolcall" || normType == "collabagenttoolcall"
+			if inlineResult && (item.Status == "completed" || item.Status == "failed" || len(item.Output) > 0 || len(item.RawResult) > 0 || item.Error != "" || item.Failure != "") {
+				flushTurn()
+				currentRole = "user"
+
+				rawOut := item.Output
+				if len(rawOut) == 0 {
+					rawOut = item.RawResult
+				}
+				extractedImages, cleanResp := extractImagesAndCleanOutput(rawOut)
+				if cleanResp == nil {
+					cleanResp = map[string]any{}
+				}
+				if item.Error != "" || item.Failure != "" {
+					errMsg := item.Error
+					if errMsg == "" {
+						errMsg = item.Failure
+					}
+					cleanResp["error"] = errMsg
+				}
+
+				if sig != "" {
+					currentParts = append(currentParts, domain.GeminiPart{
+						FunctionResponse: &domain.GeminiFunctionResponse{
+							Name:     sanitizedName,
+							Response: cleanResp,
+						},
+					})
+					for _, img := range extractedImages {
+						currentParts = append(currentParts, domain.GeminiPart{InlineData: img})
+					}
+				} else {
+					respJSON, _ := json.Marshal(cleanResp)
+					currentParts = append(currentParts, domain.GeminiPart{
+						Text: fmt.Sprintf("[Observation: %s returned %s]", sanitizedName, string(respJSON)),
+					})
+				}
 			}
 
 		case "functioncalloutput", "customtoolcalloutput", "localshellcalloutput", "localshelloutput", "mcptoolcalloutput", "toolsearchoutput":

@@ -27,3 +27,22 @@ func TestSanitizeSystemInstructionKaTeXGuidance(t *testing.T) {
 		t.Errorf("expected exactly 1 occurrence of singleDollarTextMath, got %d", count)
 	}
 }
+
+func TestKaTeXGuidanceDelimiterSyntax(t *testing.T) {
+	in := "You are a helpful assistant."
+	res := SanitizeSystemInstruction(&in, nil)
+	if res == nil {
+		t.Fatal("expected non-nil result")
+	}
+	for _, want := range []string{`\(...\)`, `\[...\]`, `$$...$$`, `\$`, "must"} {
+		if !strings.Contains(*res, want) {
+			t.Errorf("guidance missing %q", want)
+		}
+	}
+	if strings.Contains(*res, `\\(`) {
+		t.Error("delimiters must use a single backslash, found a doubled one")
+	}
+	if strings.Count(*res, "Mathematical expressions and LaTeX typesetting (KaTeX environment)") != 1 {
+		t.Error("guidance must appear exactly once")
+	}
+}

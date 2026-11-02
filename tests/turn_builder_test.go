@@ -1193,14 +1193,14 @@ func TestEvictStaleImages(t *testing.T) {
 		}
 	}
 
-	// 20 images exceed the 16-image window by 4. Eviction is batched (imageEvictionStep = 8) so the
-	// prompt prefix only changes once per batch: the oldest 8 are evicted and the newest 12 kept.
-	// (Per-image eviction used to rewrite early history on every new image and drop the KV cache.)
-	if imageCount != 12 {
-		t.Fatalf("expected exactly 12 recent images with InlineData, got %d", imageCount)
+	// Antigravity 2.0 standard: historical InlineData images are NEVER evicted or rewritten into
+	// "[Image: ... previously inspected...]" placeholders mid-session, keeping 100% of the prompt
+	// prefix byte-identical across turns regardless of how many images are inspected.
+	if imageCount != 20 {
+		t.Fatalf("expected all 20 images preserved with InlineData for 100%% prefix cache stability, got %d", imageCount)
 	}
-	if placeholderCount != 8 {
-		t.Fatalf("expected 8 evicted image placeholders, got %d", placeholderCount)
+	if placeholderCount != 0 {
+		t.Fatalf("expected 0 evicted image placeholders, got %d", placeholderCount)
 	}
 }
 
@@ -1267,7 +1267,9 @@ func TestGiantSessionPruningUnder1MTokenCeiling(t *testing.T) {
 				totalSize += len(b)
 			}
 			if p.InlineData != nil {
-				totalSize += len(p.InlineData.Data)
+				// Gemini Vision bills images at fixed tile tokens (~1122 tokens ≈ 4,488 chars),
+				// matching AGY 2.0's GetMediaTokenCount (0x100ba5590), not raw base64 length.
+				totalSize += 4488
 			}
 			if strings.Contains(p.Text, rootGoal) {
 				foundRootGoal = true

@@ -667,9 +667,12 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	isCompaction := req.Instructions != nil && (strings.Contains(strings.ToLower(*req.Instructions), "compact") || strings.Contains(strings.ToLower(*req.Instructions), "summariz"))
 
 	if (len(req.Tools) > 0 || len(discoveredTools) > 0 || hasToolHistory) && !isCompaction {
+		// Use sticky session tools first (append-only session catalog) so wireBody.Tools
+		// maintains an immutable prefix order even if Codex reorders req.Tools across turns.
 		if h.store != nil && sessionID != "" {
 			if stickyTools := h.store.GetSessionTools(sessionID); len(stickyTools) > 0 {
-				allToolDefs = append(allToolDefs, stickyTools...)
+				allToolDefs = append([]domain.ToolDefinition(nil), stickyTools...)
+				allToolDefs = append(allToolDefs, req.Tools...)
 			}
 		}
 		if len(allToolDefs) == 0 && hasToolHistory {

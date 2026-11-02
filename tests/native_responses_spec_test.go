@@ -55,7 +55,7 @@ func TestNativeRateLimitHeadersOnResponsesEndpoint(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d", res.StatusCode)
 	}
 
-	// Verify standard OpenAI rate-limit headers
+	// Commit d7ce41d removed custom quota headers: a pure API provider must not emit them.
 	headers := []string{
 		"x-ratelimit-limit-tokens",
 		"x-ratelimit-remaining-tokens",
@@ -71,8 +71,8 @@ func TestNativeRateLimitHeadersOnResponsesEndpoint(t *testing.T) {
 
 	for _, h := range headers {
 		val := res.Header.Get(h)
-		if val == "" {
-			t.Errorf("missing expected header %q", h)
+		if val != "" {
+			t.Errorf("unexpected quota header %q=%q", h, val)
 		}
 	}
 }
