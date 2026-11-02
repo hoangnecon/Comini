@@ -110,6 +110,40 @@ data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"run_command",
 	}
 }
 
+func TestConsecutiveThoughtAndTextParagraphSeparation(t *testing.T) {
+	// Reproduces rollout line 1653 where Gemini streams distinct commentary paragraphs
+	// as consecutive SSE chunks ending in "." with no trailing newline.
+	in := `data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"**Scene 20 Check**\nInitial assessment confirms a full-bleed 9:16 vertical frame."}]}}]}
+data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"**Detail Verification**\nThe lighting and atmosphere reflect the visual style."}]}}]}
+data: {"candidates":[{"content":{"parts":[{"text":"The lighting, reflections, and atmosphere accurately reflect the narrative context and visual style."}]}}]}
+data: {"candidates":[{"content":{"parts":[{"text":"Scene 20 (` + "`scene-47.jpeg`" + `) meets quality standards for canvas and raster purity."}]}}]}
+data: {"candidates":[{"content":{"parts":[{"text":"Copying the verified Scene 20 file to ` + "`part_01/scenes/scene_20.jpeg`" + `."}]}}]}
+data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"exec_command","args":{"cmd":"cp a b"}}}]}}]}
+`
+	var out strings.Builder
+	if err := streaming.MapGeminiStreamToResponses(strings.NewReader(in), &out, nil,
+		session.NewSignatureStore(time.Hour), "resp_sep", "gemini-3.8-flash", map[string]domain.ToolMeta{
+			"exec_command": {OriginalName: "exec_command"},
+		}, "s"); err != nil {
+		t.Fatal(err)
+	}
+	res := out.String()
+
+	// 1. Consecutive thought blocks must be separated by "\n\n" and have "**Title**\n\n"
+	if strings.Contains(res, "frame.**Detail") {
+		t.Fatalf("thought blocks glued together inline without paragraph break:\n%s", res)
+	}
+	if !strings.Contains(res, "**Scene 20 Check**\\n\\nInitial assessment") {
+		t.Fatalf("expected normalizeThoughtDelta to insert blank line after **Heading**:\n%s", res)
+	}
+
+	// 2. Consecutive text commentary chunks ending in "." must NOT glue together as ".Scene 20" or ".Copying"
+	if strings.Contains(res, "visual style.Scene 20") || strings.Contains(res, "purity.Copying") {
+		t.Fatalf("commentary chunks glued together inline (.Scene 20 / .Copying):\n%s", res)
+	}
+}
+
+
 func TestParseImageGenArgsMatchesAGYSchema(t *testing.T) {
 	got := domain.ParseImageGenArgs(map[string]any{
 		"Prompt":      "edit this",

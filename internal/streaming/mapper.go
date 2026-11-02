@@ -285,7 +285,11 @@ func MapGeminiStreamToResponses(
 			"output_index": idx,
 			"item":         msgItem,
 		})
+		if allEmittedText.Len() > 0 && !strings.HasSuffix(allEmittedText.String(), "\n") {
+			allEmittedText.WriteString("\n\n")
+		}
 		allEmittedText.WriteString(thoughtText)
+		allEmittedText.WriteString("\n\n")
 		hasEmittedMessage = true
 		flushSSE()
 	}
@@ -511,6 +515,14 @@ func MapGeminiStreamToResponses(
 			})
 		}
 
+		atPartStart := accumulatedReasoning.Len() == 0
+		text = normalizeThoughtDelta(text, atPartStart)
+		startsBlock := strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "**")
+		if !atPartStart && ((startsBlock && !strings.HasSuffix(accumulatedReasoning.String(), "\n") && !strings.HasPrefix(text, "\n")) ||
+			needsParagraphSeparator(accumulatedReasoning.String(), text)) {
+			text = "\n\n" + text
+		}
+
 		accumulatedReasoning.WriteString(text)
 
 		// 1. Stream raw thought into reasoning_text
@@ -522,7 +534,6 @@ func MapGeminiStreamToResponses(
 		})
 
 		// 2. Manage summary headline (for the 1-line shimmer title bar)
-		startsBlock := strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "**")
 		if len(summaryParts) == 0 {
 			acc := accumulatedReasoning.String()
 			if len(acc) >= 15 || strings.Contains(acc, "\n") || startsBlock {
@@ -723,6 +734,9 @@ scanLoop:
 
 				if len(textDelta) > 0 {
 					hasEmittedMessage = true
+					if currentMessageID != "" && accumulatedMessage.Len() > 0 && needsParagraphSeparator(accumulatedMessage.String(), textDelta) {
+						closeMessage("commentary")
+					}
 					if currentMessageID == "" {
 						currentMessageID = randomID("msg")
 						messageIndex = outputIndex
@@ -752,6 +766,9 @@ scanLoop:
 						})
 					}
 
+					if currentTurnMessage.Len() > 0 && needsParagraphSeparator(currentTurnMessage.String(), textDelta) {
+						currentTurnMessage.WriteString("\n\n")
+					}
 					accumulatedMessage.WriteString(textDelta)
 					currentTurnMessage.WriteString(textDelta)
 
@@ -1928,6 +1945,30 @@ func normalizeThoughtDelta(text string, atPartStart bool) string {
 		text = strings.ReplaceAll(text, "**\n", "**\n\n")
 	}
 	return text
+}
+
+// needsParagraphSeparator detects when Gemini streams two distinct commentary/text paragraphs
+// as back-to-back SSE chunks without a separating newline or space (e.g. chunk 1 ends with
+// "visual style." and chunk 2 begins with "Scene 20 (`scene-47.jpeg`) meets..." or "Copying the...").
+func needsParagraphSeparator(prevBuf, nextDelta string) bool {
+	if len(prevBuf) < 15 || len(nextDelta) == 0 {
+		return false
+	}
+	lastByte := prevBuf[len(prevBuf)-1]
+	if lastByte != '.' && lastByte != '!' && lastByte != '?' {
+		return false
+	}
+	prevSecond := prevBuf[len(prevBuf)-2]
+	if !((prevSecond >= 'a' && prevSecond <= 'z') || (prevSecond >= '0' && prevSecond <= '9') ||
+		prevSecond == '`' || prevSecond == ')' || prevSecond == '"' || prevSecond == '\'') {
+		return false
+	}
+	firstRune := rune(nextDelta[0])
+	for _, r := range nextDelta {
+		firstRune = r
+		break
+	}
+	return unicode.IsUpper(firstRune) || strings.HasPrefix(nextDelta, "**")
 }
 
 // extractReasoningHeadline extracts the natural opening headline or first sentence
