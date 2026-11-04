@@ -1421,10 +1421,10 @@ func TestHysteresisCompactionLocksPrefixAcross30Turns(t *testing.T) {
 		Text: "Build full-stack platform with 100% prefix cache stability",
 	})
 
-	// Build 140 turns (~4,200,000 chars total) so the session exceeds the 3,800,000-char budget
-	// and triggers hysteresis compaction down to ~2,090,000 chars.
+	// Build 70 turns (~2,100,000 chars total) so the session exceeds the 1,600,000-char budget
+	// and triggers hysteresis compaction down to ~800,000 chars.
 	chunk30k := strings.Repeat("K", 30000)
-	for i := 1; i <= 140; i++ {
+	for i := 1; i <= 70; i++ {
 		callID := fmt.Sprintf("call_hist_%d", i)
 		store.Set(callID, fmt.Sprintf("sig_hist_%d", i), "exec_command")
 		items = append(items, domain.InputItem{
@@ -1480,5 +1480,142 @@ func TestHysteresisCompactionLocksPrefixAcross30Turns(t *testing.T) {
 		prevBody = nextBody
 	}
 }
+
+func TestDualBudgetWireByteCapAndCutoffReset(t *testing.T) {
+	store := session.NewSignatureStore(time.Hour)
+	sessionID := "sess_wire_byte_ratchet_test"
+
+	// 1. Verify SetSessionCutoff(sessionID, 0) actually deletes stale cutoff
+	store.SetSessionCutoff(sessionID, 64)
+	if c, ok := store.GetSessionCutoff(sessionID); !ok || c != 64 {
+		t.Fatalf("expected cutoff 64, got %d (%v)", c, ok)
+	}
+	store.SetSessionCutoff(sessionID, 0)
+	if c, ok := store.GetSessionCutoff(sessionID); ok || c != 0 {
+		t.Fatalf("expected SetSessionCutoff(sessionID, 0) to delete cutoff, but still got %d (%v)", c, ok)
+	}
+
+	// 2. Simulate 40 turns with 115KB base64 images (~4.6 MB total wire bytes, well under 1.6M token-chars
+	// because each image is only 4,488 token-chars). Verify wire-byte hysteresis compacts payload <= 3.5 MB
+	// and locks the prefix across subsequent turns!
+	var items []domain.InputItem
+	items = append(items, domain.InputItem{
+		Type: "message",
+		Role: "user",
+		Text: "Inspect 40 UI screenshots without exceeding 3.5MB wire budget",
+	})
+
+	img115k := strings.Repeat("Q", 115000)
+	for i := 1; i <= 40; i++ {
+		callID := fmt.Sprintf("call_shot_%d", i)
+		store.Set(callID, fmt.Sprintf("sig_shot_%d", i), "view_image")
+		items = append(items, domain.InputItem{
+			Type:      "function_call",
+			Name:      "view_image",
+			CallID:    callID,
+			Arguments: fmt.Sprintf(`{"shot":%d}`, i),
+		})
+		items = append(items, domain.InputItem{
+			Type:   "function_call_output",
+			CallID: callID,
+			Output: json.RawMessage(fmt.Sprintf(`[{"type":"input_image","image_url":"data:image/jpeg;base64,%s"}]`, img115k)),
+		})
+	}
+
+	req := domain.ResponsesRequest{Model: "gemini-3.8-flash"}
+	body1 := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "HIGH", store)
+
+	raw1, _ := json.Marshal(body1)
+	if len(raw1) > 3500000 {
+		t.Fatalf("expected wire body <= 3.5MB after wire-byte hysteresis compaction, got %d bytes", len(raw1))
+	}
+
+	// Append 5 more screenshot turns and verify prefix stays 100% locked
+	for step := 41; step <= 45; step++ {
+		callID := fmt.Sprintf("call_shot_%d", step)
+		store.Set(callID, fmt.Sprintf("sig_shot_%d", step), "view_image")
+		items = append(items, domain.InputItem{
+			Type:      "function_call",
+			Name:      "view_image",
+			CallID:    callID,
+			Arguments: fmt.Sprintf(`{"shot":%d}`, step),
+		})
+		items = append(items, domain.InputItem{
+			Type:   "function_call_output",
+			CallID: callID,
+			Output: json.RawMessage(fmt.Sprintf(`[{"type":"input_image","image_url":"data:image/jpeg;base64,%s"}]`, img115k)),
+		})
+
+		bodyNext := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "HIGH", store)
+		if len(bodyNext.Contents) != len(body1.Contents)+2 {
+			t.Fatalf("step %d: expected locked cutoff (contents %d -> %d), got %d",
+				step, len(body1.Contents), len(body1.Contents)+2, len(bodyNext.Contents))
+		}
+		for idx := 0; idx < len(body1.Contents); idx++ {
+			b1, _ := json.Marshal(body1.Contents[idx])
+			b2, _ := json.Marshal(bodyNext.Contents[idx])
+			if string(b1) != string(b2) {
+				t.Fatalf("step %d: prefix turn %d mutated!", step, idx)
+			}
+		}
+		body1 = bodyNext
+	}
+}
+
+func TestThoughtCirculationSuppression(t *testing.T) {
+	store := session.NewSignatureStore(time.Hour)
+	sessionID := "sess_thought_suppression_test"
+
+	// Simulate conversation with user prompt, assistant thought commentary, tool call, and tool response
+	items := []domain.InputItem{
+		{
+			Type: "message",
+			Role: "user",
+			Text: "Analyze the database schema",
+		},
+		{
+			Type:  "message",
+			Role:  "assistant",
+			ID:    "msg_thought_12345",
+			Phase: "commentary",
+			Text:  "\u200b> Let me reason step by step about the table structure...",
+		},
+		{
+			Type:  "message",
+			Role:  "assistant",
+			ID:    "msg_plain_99999",
+			Phase: "",
+			Text:  "**Thinking**\n\n> Checking primary keys and foreign constraints in SQL...",
+		},
+		{
+			Type:      "function_call",
+			Name:      "inspect_schema",
+			CallID:    "call_schema_01",
+			Arguments: `{"table":"users"}`,
+		},
+		{
+			Type:   "function_call_output",
+			CallID: "call_schema_01",
+			Output: json.RawMessage(`{"status":"ok","columns":["id","email"]}`),
+		},
+	}
+	store.Set("call_schema_01", "sig_schema_01", "inspect_schema")
+
+	req := domain.ResponsesRequest{Model: "gemini-3.8-flash"}
+	body := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "HIGH", store)
+
+	// Verify that NO contents contain thoughts or thinking texts
+	for i, c := range body.Contents {
+		for j, p := range c.Parts {
+			if p.Thought {
+				t.Fatalf("turn %d part %d has Thought=true; thought circulation was not suppressed!", i, j)
+			}
+			if strings.Contains(p.Text, "reason step by step") || strings.Contains(p.Text, "Checking primary keys") {
+				t.Fatalf("turn %d part %d contains historical thought text: %q", i, j, p.Text)
+			}
+		}
+	}
+}
+
 
 

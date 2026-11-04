@@ -365,11 +365,20 @@ func (s *SignatureStore) GetSessionCutoff(sessionID string) (int, bool) {
 }
 
 func (s *SignatureStore) SetSessionCutoff(sessionID string, cutoff int) {
-	if s == nil || sessionID == "" || cutoff <= 0 {
+	if s == nil || sessionID == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if cutoff <= 0 {
+		if len(s.sessionCutoffs) > 0 {
+			if _, ok := s.sessionCutoffs[sessionID]; ok {
+				delete(s.sessionCutoffs, sessionID)
+				s.saveLocked()
+			}
+		}
+		return
+	}
 	if s.sessionCutoffs == nil {
 		s.sessionCutoffs = make(map[string]int)
 	}

@@ -133,19 +133,19 @@ func TestResolveModelAndEffortLadder(t *testing.T) {
 		expectedWire  string
 		expectedLevel string
 	}{
-		// 3.8 Flash (wire suffix encodes effort, thinkingBudget is used instead of thinkingLevel)
-		{"gemini-3.8-flash", "low", "gemini-3.8-flash-low", ""},
-		{"gemini-3.8-flash", "medium", "gemini-3.8-flash-medium", ""},
-		{"gemini-3.8-flash", "high", "gemini-3.8-flash-high", ""},
-		{"google-antigravity/gemini-3.8-flash", "high", "gemini-3.8-flash-high", ""},
-		{"gemini-3.8-flash-low", "", "gemini-3.8-flash-low", ""},
-		{"gemini-3.8-flash-medium", "", "gemini-3.8-flash-medium", ""},
+		// 3.8 Flash (matching native AGY 2.0 language_server at 0x1021398fc: thinkingLevel is "LOW", "MEDIUM", "HIGH", budget is nil)
+		{"gemini-3.8-flash", "low", "gemini-3.8-flash-low", "LOW"},
+		{"gemini-3.8-flash", "medium", "gemini-3.8-flash-medium", "MEDIUM"},
+		{"gemini-3.8-flash", "high", "gemini-3.8-flash-high", "HIGH"},
+		{"google-antigravity/gemini-3.8-flash", "high", "gemini-3.8-flash-high", "HIGH"},
+		{"gemini-3.8-flash-low", "", "gemini-3.8-flash-low", "LOW"},
+		{"gemini-3.8-flash-medium", "", "gemini-3.8-flash-medium", "MEDIUM"},
 
 		// 3.7 Flash is aliased to 3.8 Flash (CCA returns 404 for 3.7; see transport/router.go)
-		{"gemini-3.7-flash", "low", "gemini-3.8-flash-low", ""},
-		{"gemini-3.7-flash", "medium", "gemini-3.8-flash-medium", ""},
-		{"gemini-3.7-flash", "high", "gemini-3.8-flash-high", ""},
-		{"google-antigravity/gemini-3.7-flash", "", "gemini-3.8-flash-high", ""},
+		{"gemini-3.7-flash", "low", "gemini-3.8-flash-low", "LOW"},
+		{"gemini-3.7-flash", "medium", "gemini-3.8-flash-medium", "MEDIUM"},
+		{"gemini-3.7-flash", "high", "gemini-3.8-flash-high", "HIGH"},
+		{"google-antigravity/gemini-3.7-flash", "", "gemini-3.8-flash-high", "HIGH"},
 
 		// 3.1 Pro (low -> gemini-3.1-pro-low, high/medium -> gemini-pro-agent)
 		{"gemini-3.1-pro", "low", "gemini-3.1-pro-low", "low"},

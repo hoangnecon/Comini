@@ -28,11 +28,11 @@ func applyAGY2ModelDetails(wireModelID string, fallbackThinkingLevel string) Res
 		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "HIGH", MaxOutputTokens: 65536}
 
 	case "gemini-3.8-flash-low":
-		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "", ThinkingBudget: intPtr(1000), MaxOutputTokens: 65536}
+		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "LOW", MaxOutputTokens: 65536}
 	case "gemini-3.8-flash-medium":
-		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "", ThinkingBudget: intPtr(4000), MaxOutputTokens: 65536}
+		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "MEDIUM", MaxOutputTokens: 65536}
 	case "gemini-3.8-flash-high":
-		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "", ThinkingBudget: intPtr(-1), MaxOutputTokens: 65536}
+		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "HIGH", MaxOutputTokens: 65536}
 
 	case "claude-opus-5-5-low", "claude-sonnet-5-5-low":
 		return ResolvedModel{WireModelID: wireModelID, ThinkingLevel: "LOW", MaxOutputTokens: 128000}

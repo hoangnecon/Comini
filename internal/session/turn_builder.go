@@ -642,11 +642,15 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 		}
 	}
 
-	// 1. Clean empty parts inside each turn
+	// 1. Clean empty parts inside each turn and suppress thought circulation
+	// (matching AGY 2.0 language_server: SupportsThoughtCirculation == false at 0x101b89f74 and 0x101611a50)
 	var cleanContents []domain.GeminiContent
 	for _, c := range contents {
 		var validParts []domain.GeminiPart
 		for _, p := range c.Parts {
+			if p.Thought || isSyntheticThoughtText(p.Text) {
+				continue
+			}
 			if p.Text != "" || p.FunctionCall != nil || p.FunctionResponse != nil || p.InlineData != nil {
 				validParts = append(validParts, p)
 			}
@@ -748,9 +752,10 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 //   - maxSide         = 2576      (0xa10 = 2576 px)
 //   - jpegQuality     = 85        (0x55)
 const (
-	agyMaxEncodedImageBytes = 5 * 1024 * 1024 // 5 MiB raw bytes
-	agyMaxImageSide         = 2576
-	agyJPEGQuality          = 85
+	agyMaxEncodedImageBytes = 300 * 1024 // 300 KiB raw bytes (~400 KB base64 ceiling per image)
+	agyMaxImageSide         = 1568       // Optimal Gemini Vision tile resolution (1568 px max side)
+	agyJPEGQuality          = 80
+	agyBypassBase64Bytes    = 120 * 1024 // Only bypass JPEG compression when already <= 120 KB base64
 )
 
 type cachedMediaResult struct {
@@ -835,10 +840,12 @@ func compressOversizedImage(in *domain.GeminiInlineData) (*domain.GeminiInlineDa
 		w, h = cfg.Width, cfg.Height
 	}
 
-	// Fast path: matches AGY 2.0's CompressMedia check — if raw bytes <= maxEncodedBytes (5 MiB)
-	// and both dimensions <= maxSide (2576 px) and the wire base64 is already compact (<= 600KB),
-	// keep the original image bytes untouched.
-	if len(raw) <= agyMaxEncodedImageBytes && w <= agyMaxImageSide && h <= agyMaxImageSide && len(in.Data) <= 600000 {
+	// Fast path: if raw bytes <= agyMaxEncodedImageBytes (300 KiB), both dimensions <= agyMaxImageSide (1568 px),
+	// and the wire base64 is already compact (<= 120 KB), keep the original image bytes untouched.
+	// Because compressOversizedImage runs deterministically on every turn (memoized by sha256(in.Data)),
+	// any image > 120 KB is compressed to compact JPEG on its very first appearance and remains 100%
+	// byte-for-byte identical across all subsequent turns — preserving 100% KV cache hits.
+	if len(raw) <= agyMaxEncodedImageBytes && w <= agyMaxImageSide && h <= agyMaxImageSide && len(in.Data) <= agyBypassBase64Bytes {
 		tokens := estimateMediaTokens(w, h)
 		mediaProcessCache.Store(sum, cachedMediaResult{inlineData: in, tokens: tokens})
 		return in, tokens
@@ -947,9 +954,6 @@ func isSyntheticThoughtItem(item domain.InputItem) bool {
 	if item.Role != "" && item.Role != "assistant" {
 		return false
 	}
-	if !strings.EqualFold(item.Phase, "commentary") {
-		return false
-	}
 	if item.Text != "" && isSyntheticThoughtText(item.Text) {
 		return true
 	}
@@ -959,6 +963,9 @@ func isSyntheticThoughtItem(item domain.InputItem) bool {
 				return true
 			}
 		}
+	}
+	if strings.EqualFold(item.Phase, "commentary") {
+		return true
 	}
 	return false
 }
@@ -1073,10 +1080,40 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 		return total
 	}
 
-	// Context ceiling safety net set to 3,800,000 textual chars (~950,000 - 1,000,000 tokens).
-	// Normal sessions auto-compact natively in Codex at auto_compact_token_limit = 1,000,000 tokens,
-	// keeping 100% of the prefix immutable across the full 1M context window.
-	const maxCharsBudget = 3800000
+	// Physical wire byte counter (includes actual base64 InlineData length + JSON text/args)
+	// so multi-screenshot sessions never bloat to 20+ MB and stall over HTTP/1.1 uploads.
+	calcContentWireBytes := func(c domain.GeminiContent) int {
+		total := 64
+		for _, p := range c.Parts {
+			total += len(p.Text)
+			if p.FunctionCall != nil {
+				b, _ := json.Marshal(p.FunctionCall.Args)
+				total += len(b) + 64
+			}
+			if p.FunctionResponse != nil {
+				b, _ := json.Marshal(p.FunctionResponse.Response)
+				total += len(b) + 64
+			}
+			if p.InlineData != nil {
+				total += len(p.InlineData.Data) + 64
+			}
+		}
+		return total
+	}
+
+	calcTotalWireBytes := func(cts []domain.GeminiContent) int {
+		total := 0
+		for _, c := range cts {
+			total += calcContentWireBytes(c)
+		}
+		return total
+	}
+
+	// Dual-Budget Hysteresis Ceiling:
+	// 1) Token/char ceiling: 1,600,000 chars (~400,000 tokens, matching AGY 2.0's fast context window).
+	// 2) Physical wire ceiling: 3,500,000 bytes (~3.5 MB JSON + base64 payload) so uploads take <0.4s.
+	const maxCharsBudget = 1600000
+	const maxWireBytesBudget = 3500000
 
 	// Check if this session already has a ratcheted cutoffIndex from an earlier compaction.
 	lastCutoff := 0
@@ -1094,37 +1131,43 @@ func enforceContextBudgetOnContents(contents []domain.GeminiContent, sessionID s
 	}
 
 	// Fast path 1: If session already compacted at lastCutoff, keep cutoffIndex 100% locked
-	// at lastCutoff as long as the active window fits within maxCharsBudget!
+	// at lastCutoff as long as the active window fits within both maxCharsBudget and maxWireBytesBudget!
 	if hasCutoff {
 		first := contents[0]
 		preserved := extractPreservedUserTurns(contents, lastCutoff)
 		recent := contents[lastCutoff:]
 		windowSize := calcContentSize(first) + calcTotalSize(preserved) + calcTotalSize(recent)
-		if windowSize <= maxCharsBudget {
+		windowWire := calcContentWireBytes(first) + calcTotalWireBytes(preserved) + calcTotalWireBytes(recent)
+		if windowSize <= maxCharsBudget && windowWire <= maxWireBytesBudget {
 			newContents := make([]domain.GeminiContent, 0, 1+len(preserved)+len(recent))
 			newContents = append(newContents, first)
 			newContents = append(newContents, preserved...)
 			newContents = append(newContents, recent...)
 			return sanitizeAndValidateGeminiContents(newContents)
 		}
-	} else if calcTotalSize(contents) <= maxCharsBudget {
-		// Fast path 2: Session has never exceeded maxCharsBudget yet.
+	} else if calcTotalSize(contents) <= maxCharsBudget && calcTotalWireBytes(contents) <= maxWireBytesBudget {
+		// Fast path 2: Session has never exceeded either budget yet.
 		return sanitizeAndValidateGeminiContents(contents)
 	}
 
-	// Stage 2: Hysteresis Compaction when window exceeds maxCharsBudget (800,000 chars).
-	// Drop retained tail down to 55% of budget (~440,000 chars ≈ 110,000 tokens),
-	// creating 360,000 chars (~90,000 tokens ≈ 50-80 consecutive turns) of 100% frozen prefix headroom!
-	retainTarget := maxCharsBudget * 55 / 100
-	accumulated := 0
+	// Stage 2: Dual-Budget Hysteresis Compaction when window exceeds maxCharsBudget or maxWireBytesBudget.
+	// Drop retained tail down to 50% of both budgets (~800,000 chars ≈ 200k tokens, <= 1.75 MB wire bytes),
+	// creating 60-120 consecutive turns of 100% frozen prefix headroom!
+	retainCharsTarget := maxCharsBudget * 50 / 100
+	retainWireTarget := maxWireBytesBudget * 50 / 100
+	accumulatedChars := 0
+	accumulatedWire := 0
 	rawCutoff := 1
 	for i := len(contents) - 1; i >= 1; i-- {
 		sz := calcContentSize(contents[i])
-		if accumulated+sz > retainTarget {
+		wb := calcContentWireBytes(contents[i])
+		// Always retain at least the very latest turn (i == len(contents)-1) even if it holds a large image
+		if i < len(contents)-1 && (accumulatedChars+sz > retainCharsTarget || accumulatedWire+wb > retainWireTarget) {
 			rawCutoff = i + 1
 			break
 		}
-		accumulated += sz
+		accumulatedChars += sz
+		accumulatedWire += wb
 	}
 
 	cutoffIndex := (rawCutoff / 16) * 16

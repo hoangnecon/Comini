@@ -1440,6 +1440,13 @@ scanLoop:
 		}
 	}
 	isAbnormalFinish := currentTurnToolCalls == 0 && lastFinishReason != "" && lastFinishReason != "STOP"
+	scanErr := scanner.Err()
+	if scanErr != nil && (streamOpts.Context == nil || streamOpts.Context.Err() == nil) {
+		log.Printf("[Comini Stream] ⚠️ Upstream SSE read error mid-stream: %v (finishReason=%q, toolCalls=%d)", scanErr, lastFinishReason, currentTurnToolCalls)
+		if currentTurnToolCalls == 0 {
+			isAbnormalFinish = true
+		}
+	}
 
 	// Safety net: if no actionable items (no final_answer message, no tool call) were emitted,
 	// OR if the model stream aborted mid-sentence / with MALFORMED_FUNCTION_CALL before emitting its tool call,
