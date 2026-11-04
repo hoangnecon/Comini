@@ -642,13 +642,23 @@ func sanitizeAndValidateGeminiContents(contents []domain.GeminiContent) []domain
 		}
 	}
 
-	// 1. Clean empty parts inside each turn and suppress thought circulation
-	// (matching AGY 2.0 language_server: SupportsThoughtCirculation == false at 0x101b89f74 and 0x101611a50)
+	// 1. Clean empty parts inside each turn and suppress thought circulation on older turns.
+	// Preserves prior reasoning ONLY in the latest model turn for immediate context continuity,
+	// while stripping thoughts from all older historical turns to prevent prompt bloat.
+	lastModelIdx := -1
+	for i := len(contents) - 1; i >= 0; i-- {
+		if contents[i].Role == "model" {
+			lastModelIdx = i
+			break
+		}
+	}
+
 	var cleanContents []domain.GeminiContent
-	for _, c := range contents {
+	for cIdx, c := range contents {
+		isLatestModel := (cIdx == lastModelIdx)
 		var validParts []domain.GeminiPart
 		for _, p := range c.Parts {
-			if p.Thought || isSyntheticThoughtText(p.Text) {
+			if !isLatestModel && (p.Thought || isSyntheticThoughtText(p.Text)) {
 				continue
 			}
 			if p.Text != "" || p.FunctionCall != nil || p.FunctionResponse != nil || p.InlineData != nil {
@@ -944,7 +954,32 @@ func isSyntheticThoughtText(raw string) bool {
 	if strings.HasPrefix(trimmed, "**") && strings.Contains(trimmed, "\n\n>") {
 		return true
 	}
+	if strings.HasPrefix(trimmed, "[Prior reasoning:") {
+		return true
+	}
 	return false
+}
+
+func cleanThoughtTextForModel(raw string) string {
+	txt := strings.TrimPrefix(raw, "\u200b")
+	txt = strings.TrimSpace(txt)
+	if strings.HasPrefix(txt, "**Thinking**") {
+		txt = strings.TrimPrefix(txt, "**Thinking**")
+		txt = strings.TrimSpace(txt)
+	}
+	for strings.HasPrefix(txt, ">") {
+		txt = strings.TrimPrefix(txt, ">")
+		txt = strings.TrimSpace(txt)
+	}
+	txt = harness.SanitizeMessageText(txt)
+	txt = strings.TrimSpace(txt)
+	if txt == "" {
+		return ""
+	}
+	if len(txt) > 4000 {
+		txt = txt[:4000] + "..."
+	}
+	return "[Prior reasoning: " + txt + "]"
 }
 
 func isSyntheticThoughtItem(item domain.InputItem) bool {
@@ -1407,7 +1442,15 @@ func BuildGeminiWireBodyWithItems(
 		}
 	}
 
-	for _, item := range items {
+	lastThoughtItemIdx := -1
+	for i := len(items) - 1; i >= 0; i-- {
+		if isSyntheticThoughtItem(items[i]) {
+			lastThoughtItemIdx = i
+			break
+		}
+	}
+
+	for idx, item := range items {
 		normType := normalizeType(item.Type)
 
 		switch normType {
@@ -1569,6 +1612,28 @@ func BuildGeminiWireBodyWithItems(
 
 		case "agentmessage":
 			if isSyntheticThoughtItem(item) {
+				if idx != lastThoughtItemIdx {
+					continue
+				}
+				if currentRole != "" && currentRole != "model" {
+					flushTurn()
+				}
+				currentRole = "model"
+				var rawThought string
+				if item.Text != "" {
+					rawThought = item.Text
+				} else if len(item.Content) > 0 {
+					for _, p := range extractPartsFromContent(item.Content) {
+						if p.Text != "" && isSyntheticThoughtText(p.Text) {
+							rawThought = p.Text
+							break
+						}
+					}
+				}
+				cleanTxt := cleanThoughtTextForModel(rawThought)
+				if cleanTxt != "" {
+					currentParts = append(currentParts, domain.GeminiPart{Text: cleanTxt})
+				}
 				continue
 			}
 			if currentRole != "" && currentRole != "model" {
@@ -1594,6 +1659,28 @@ func BuildGeminiWireBodyWithItems(
 
 		case "message", "usermessage", "text", "inputtext", "":
 			if isSyntheticThoughtItem(item) {
+				if idx != lastThoughtItemIdx {
+					continue
+				}
+				if currentRole != "" && currentRole != "model" {
+					flushTurn()
+				}
+				currentRole = "model"
+				var rawThought string
+				if item.Text != "" {
+					rawThought = item.Text
+				} else if len(item.Content) > 0 {
+					for _, p := range extractPartsFromContent(item.Content) {
+						if p.Text != "" && isSyntheticThoughtText(p.Text) {
+							rawThought = p.Text
+							break
+						}
+					}
+				}
+				cleanTxt := cleanThoughtTextForModel(rawThought)
+				if cleanTxt != "" {
+					currentParts = append(currentParts, domain.GeminiPart{Text: cleanTxt})
+				}
 				continue
 			}
 			role := "user"

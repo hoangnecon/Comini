@@ -1566,8 +1566,9 @@ func TestThoughtCirculationSuppression(t *testing.T) {
 	store := session.NewSignatureStore(time.Hour)
 	sessionID := "sess_thought_suppression_test"
 
-	// Simulate conversation with user prompt, assistant thought commentary, tool call, and tool response
+	// Simulate multi-turn conversation with older thought (turn 1) and latest thought (turn 2)
 	items := []domain.InputItem{
+		// Turn 1
 		{
 			Type: "message",
 			Role: "user",
@@ -1576,16 +1577,9 @@ func TestThoughtCirculationSuppression(t *testing.T) {
 		{
 			Type:  "message",
 			Role:  "assistant",
-			ID:    "msg_thought_12345",
+			ID:    "msg_thought_1",
 			Phase: "commentary",
 			Text:  "\u200b> Let me reason step by step about the table structure...",
-		},
-		{
-			Type:  "message",
-			Role:  "assistant",
-			ID:    "msg_plain_99999",
-			Phase: "",
-			Text:  "**Thinking**\n\n> Checking primary keys and foreign constraints in SQL...",
 		},
 		{
 			Type:      "function_call",
@@ -1598,22 +1592,59 @@ func TestThoughtCirculationSuppression(t *testing.T) {
 			CallID: "call_schema_01",
 			Output: json.RawMessage(`{"status":"ok","columns":["id","email"]}`),
 		},
+		// Turn 2
+		{
+			Type:  "message",
+			Role:  "assistant",
+			ID:    "msg_thought_2",
+			Phase: "commentary",
+			Text:  "**Thinking**\n\n> Now checking foreign keys from orders to users...",
+		},
+		{
+			Type:      "function_call",
+			Name:      "inspect_foreign_keys",
+			CallID:    "call_schema_02",
+			Arguments: `{"table":"orders"}`,
+		},
+		{
+			Type:   "function_call_output",
+			CallID: "call_schema_02",
+			Output: json.RawMessage(`{"status":"ok","foreign_keys":[{"col":"user_id","ref":"users.id"}]}`),
+		},
 	}
 	store.Set("call_schema_01", "sig_schema_01", "inspect_schema")
+	store.Set("call_schema_02", "sig_schema_02", "inspect_foreign_keys")
 
 	req := domain.ResponsesRequest{Model: "gemini-3.8-flash"}
 	body := session.BuildGeminiWireBodyWithItems(&req, items, sessionID, nil, "HIGH", store)
 
-	// Verify that NO contents contain thoughts or thinking texts
+	// Verify that older thought (turn 1) was stripped completely
+	// but the latest thought (turn 2) is preserved as prior reasoning in the latest model turn!
+	var foundOlderThought bool
+	var foundLatestThought bool
+
 	for i, c := range body.Contents {
 		for j, p := range c.Parts {
 			if p.Thought {
-				t.Fatalf("turn %d part %d has Thought=true; thought circulation was not suppressed!", i, j)
+				t.Fatalf("turn %d part %d has Thought=true", i, j)
 			}
-			if strings.Contains(p.Text, "reason step by step") || strings.Contains(p.Text, "Checking primary keys") {
-				t.Fatalf("turn %d part %d contains historical thought text: %q", i, j, p.Text)
+			if strings.Contains(p.Text, "reason step by step about the table structure") {
+				foundOlderThought = true
+			}
+			if strings.Contains(p.Text, "Now checking foreign keys from orders to users") {
+				foundLatestThought = true
+				if !strings.HasPrefix(p.Text, "[Prior reasoning:") {
+					t.Fatalf("expected latest thought to be formatted with [Prior reasoning:...], got %q", p.Text)
+				}
 			}
 		}
+	}
+
+	if foundOlderThought {
+		t.Fatalf("older thought from turn 1 should be stripped from historical contents to prevent context bloat!")
+	}
+	if !foundLatestThought {
+		t.Fatalf("latest thought from turn 2 should be preserved in the immediate prior model turn to maintain train of thought!")
 	}
 }
 
